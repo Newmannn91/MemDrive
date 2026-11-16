@@ -235,8 +235,68 @@ export class LocalStorageBackend implements StorageBackend {
       }
     }
     if (mode === 'append') {
-      const existed = await this.exists(relPath);
-      const handle = await fs.open(target, 'a');
+      // Check read-only before open (non-root open('a') throws raw EACCES
+      // before handle.stat() runs), and distinguish new vs existing open so
+      // `created` is race-free.
+      let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+      let created = false;
+      for (let attempt = 0; attempt < 16; attempt++) {
+        let preStat: Awaited<ReturnType<typeof fs.stat>> | null = null;
+        try {
+          preStat = await fs.stat(target);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+            throw error;
+          }
+        }
+        if (preStat !== null) {
+          if (!preStat.isDirectory() && !(preStat.mode & 0o200)) {
+            throw new MemDriveError('READ_ONLY', `File is read-only: ${relPath}`);
+          }
+          try {
+            handle = await fs.open(
+              target,
+              fs.constants.O_WRONLY | fs.constants.O_APPEND,
+            );
+            created = false;
+            break;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT' && attempt < 15) {
+              continue;
+            }
+            throw error;
+          }
+        }
+        try {
+          handle = await fs.open(target, 'wx');
+          created = true;
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+            // Distinguish a concurrent file creation from a dangling symlink
+            // (O_CREAT|O_EXCL fails with EEXIST on a dangling symlink).
+            try {
+              const lst = await fs.lstat(target);
+              if (lst.isSymbolicLink()) {
+                handle = await fs.open(target, 'a');
+                created = true;
+                break;
+              }
+            } catch (lstatError) {
+              if ((lstatError as NodeJS.ErrnoException).code !== 'ENOENT') {
+                throw lstatError;
+              }
+            }
+            if (attempt < 15) {
+              continue;
+            }
+          }
+          throw error;
+        }
+      }
+      if (handle === undefined) {
+        throw new Error(`Could not open ${relPath} for append`);
+      }
       try {
         const st = await handle.stat();
         if (!(st.mode & 0o200)) {
@@ -261,7 +321,7 @@ export class LocalStorageBackend implements StorageBackend {
       } finally {
         await handle.close();
       }
-      return { created: !existed };
+      return { created };
     }
     // Atomic replace via the shared helper (resolves symlinks with
     // a sandbox check, preserves permissions, refuses read-only
@@ -291,34 +351,97 @@ export class LocalStorageBackend implements StorageBackend {
     await assertInsideRealRoot(rootRealDir, srcAbs);
     await assertInsideRealRoot(rootRealDir, destAbs);
     try {
+      const lst = await fs.lstat(srcAbs);
       await fs.mkdir(path.dirname(destAbs), { recursive: true });
-      try {
-        await fs.link(srcAbs, destAbs);
-      } catch (linkError) {
-        const linkCode = (linkError as NodeJS.ErrnoException).code;
-        if (
-          linkCode === 'EPERM' ||
-          linkCode === 'ENOSYS' ||
-          linkCode === 'EOPNOTSUPP' ||
-          linkCode === 'ENOTSUP' ||
-          linkCode === 'EXDEV' ||
-          linkCode === 'EMLINK'
-        ) {
-          try {
-            await fs.copyFile(srcAbs, destAbs, fs.constants.COPYFILE_EXCL);
-          } catch (copyError) {
-            if ((copyError as NodeJS.ErrnoException).code !== 'EEXIST') {
-              await fs.unlink(destAbs).catch(() => undefined); // only clean up a partial target we created
-            }
-            throw copyError;
+      let linkTarget: string | undefined;
+      if (lst.isSymbolicLink()) {
+        linkTarget = await fs.readlink(srcAbs);
+        let newTarget = linkTarget;
+        if (!path.isAbsolute(linkTarget)) {
+          const realSrcParent = await fs.realpath(path.dirname(srcAbs));
+          const realDestParent = await fs.realpath(path.dirname(destAbs));
+          if (realSrcParent !== realDestParent) {
+            const resolvedTarget = path.resolve(realSrcParent, linkTarget);
+            newTarget = path.relative(realDestParent, resolvedTarget) || '.';
           }
+        }
+        if (process.platform === 'win32') {
+          let targetIsDir = false;
+          try {
+            targetIsDir = (await fs.stat(srcAbs)).isDirectory();
+          } catch {
+            targetIsDir = false;
+          }
+          await fs.symlink(newTarget, destAbs, targetIsDir ? 'dir' : 'file');
         } else {
-          throw linkError;
+          await fs.symlink(newTarget, destAbs);
+        }
+      } else {
+        try {
+          await fs.link(srcAbs, destAbs);
+        } catch (linkError) {
+          const linkCode = (linkError as NodeJS.ErrnoException).code;
+          if (
+            linkCode === 'EPERM' ||
+            linkCode === 'ENOSYS' ||
+            linkCode === 'EOPNOTSUPP' ||
+            linkCode === 'ENOTSUP' ||
+            linkCode === 'EXDEV' ||
+            linkCode === 'EMLINK'
+          ) {
+            try {
+              await fs.copyFile(srcAbs, destAbs, fs.constants.COPYFILE_EXCL);
+            } catch (copyError) {
+              if ((copyError as NodeJS.ErrnoException).code !== 'EEXIST') {
+                await fs.unlink(destAbs).catch(() => undefined); // only clean up a partial target we created
+              }
+              throw copyError;
+            }
+          } else {
+            throw linkError;
+          }
         }
       }
       try {
+        // Verify srcAbs is still the same entry we started moving before
+        // unlinking it: if a sync client or another process replaced it
+        // after destAbs was created, unlinking would destroy the new
+        // content. Exclude ctimeMs because fs.link updates ctime/nlink.
+        const currentLst = await fs.lstat(srcAbs);
+        const sameEntry =
+          currentLst.dev === lst.dev &&
+          currentLst.ino === lst.ino &&
+          currentLst.isSymbolicLink() === lst.isSymbolicLink() &&
+          (currentLst.mode & fs.constants.S_IFMT) === (lst.mode & fs.constants.S_IFMT) &&
+          currentLst.size === lst.size &&
+          currentLst.mtimeMs === lst.mtimeMs;
+        if (!sameEntry) {
+          return;
+        }
+        if (linkTarget !== undefined) {
+          let currentLinkTarget: string;
+          try {
+            currentLinkTarget = await fs.readlink(srcAbs);
+          } catch (readlinkErr) {
+            if ((readlinkErr as NodeJS.ErrnoException).code === 'EINVAL') {
+              // Replaced by a non-symlink between lstat and readlink.
+              return;
+            }
+            throw readlinkErr;
+          }
+          if (currentLinkTarget !== linkTarget) {
+            return;
+          }
+        }
         await fs.unlink(srcAbs);
       } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+          // The source vanished after the target was created (a sync
+          // client or another process moved it). The target is now
+          // the only complete copy: the move has effectively
+          // succeeded, and rolling back would destroy the data.
+          return;
+        }
         await fs.unlink(destAbs).catch(() => undefined); // rollback: delete the created target, source file remains
         throw e;
       }
@@ -334,6 +457,24 @@ export class LocalStorageBackend implements StorageBackend {
         throw new NotFoundError(`File not found: ${srcRel}`);
       }
       throw error;
+    }
+  }
+
+  /**
+   * macOS only: a cloud file with no local content (evicted by
+   * iCloud Drive / OneDrive) reports zero allocated blocks.
+   * Protected so tests can simulate a dataless file on Linux,
+   * where the platform gate never triggers.
+   */
+  protected async isDatalessFile(relPath: string, size: number): Promise<boolean> {
+    if (process.platform !== 'darwin' || size === 0) {
+      return false;
+    }
+    try {
+      const st = await this.stat(relPath);
+      return st !== null && st.blocks === 0;
+    } catch {
+      return false;
     }
   }
 
@@ -357,6 +498,20 @@ export class LocalStorageBackend implements StorageBackend {
     if (lowerRelDir === 'archive' || lowerRelDir.startsWith('archive/')) {
       return hits;
     }
+    // Match the indexed walk: dot directories/files and `.icloud`
+    // placeholders are never searched.
+    if (
+      relDir !== '' &&
+      relDir !== '.' &&
+      relDir
+        .split('/')
+        .some(
+          (seg) =>
+            (seg.startsWith('.') && seg !== '.') || seg.toLowerCase().endsWith('.icloud'),
+        )
+    ) {
+      return hits;
+    }
     // The search root was sandbox-checked by the caller, but the walk
     // discovers entries the caller never validated. A symlink inside
     // the root may point at a file outside it, and fs.stat follows
@@ -370,13 +525,28 @@ export class LocalStorageBackend implements StorageBackend {
     } catch {
       rootRealDir = this.rootDir;
     }
-    // Resolve the archive dir realpath (if it exists) so symlinks into
-    // archive/ are excluded, not just the literal top-level name.
-    let archiveReal: string | null = null;
+    // Resolve top-level archive dir realpaths case-insensitively (e.g.,
+    // `Archive/` on case-sensitive Linux) so symlinks into any archive/
+    // variant are excluded, not just the literal lowercase name.
+    const archiveReals: string[] = [];
     try {
-      archiveReal = await fs.realpath(this.absolute('archive'));
+      const topEntries = await fs.readdir(this.rootDir, { withFileTypes: true });
+      for (const dirent of topEntries) {
+        if (dirent.name.toLowerCase() !== 'archive') {
+          continue;
+        }
+        const abs = path.join(this.rootDir, dirent.name);
+        try {
+          const st = await fs.stat(abs);
+          if (st.isDirectory()) {
+            archiveReals.push(await fs.realpath(abs));
+          }
+        } catch {
+          // Vanished or broken link: ignore.
+        }
+      }
     } catch {
-      archiveReal = null;
+      // Unreadable root: listDirectory below will handle it.
     }
     // When a relDir scope is given, confine the walk to its realpath.
     let scopeReal: string | null = null;
@@ -388,6 +558,9 @@ export class LocalStorageBackend implements StorageBackend {
       }
     }
     const visitedDirs = new Set<string>([rootRealDir]);
+    if (scopeReal !== null) {
+      visitedDirs.add(scopeReal);
+    }
     const queue: string[] = [relDir];
     while (queue.length > 0 && hits.length < maxResults) {
       const current = queue.shift() as string;
@@ -401,13 +574,19 @@ export class LocalStorageBackend implements StorageBackend {
         if (hits.length >= maxResults) {
           break;
         }
+        // Skip dot entries (`.git`, `.obsidian`, dotfiles) and iCloud
+        // placeholders (`.icloud`) to match LocalSearchIndex and never
+        // trigger cloud downloads or leak hidden metadata.
+        if (entry.name.startsWith('.') || entry.name.toLowerCase().endsWith('.icloud')) {
+          continue;
+        }
         let real: string;
         try {
           real = await fs.realpath(this.absolute(entry.relPath));
           if (!isInside(rootRealDir, real)) {
             continue;
           }
-          if (archiveReal !== null && isInside(archiveReal, real)) {
+          if (archiveReals.some((ar) => isInside(ar, real))) {
             continue;
           }
           if (scopeReal !== null && !isInside(scopeReal, real)) {
@@ -435,8 +614,12 @@ export class LocalStorageBackend implements StorageBackend {
           hits.push(entry.relPath);
           continue;
         }
-        // Content match for small files only; binary content is skipped.
+        // Content match for small files only; binary content and
+        // macOS dataless cloud placeholders are skipped without reading.
         if (entry.size > 0 && entry.size <= SEARCH_CONTENT_MAX_BYTES) {
+          if (await this.isDatalessFile(entry.relPath, entry.size)) {
+            continue;
+          }
           try {
             const data = await this.readFile(entry.relPath);
             if (looksLikeText(data) && data.toString('utf8').toLowerCase().includes(needle)) {

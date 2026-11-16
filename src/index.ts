@@ -70,6 +70,7 @@ async function main(): Promise<void> {
     }
     const backend = new LocalStorageBackend(rootRealDir);
     const searchIndex = new LocalSearchIndex(rootRealDir, rootRealDir, backend);
+    await searchIndex.load();
     const { lines, exitCode } = await runApplyCleanup(planId, { backend, rootDir: rootRealDir, rootRealDir, searchIndex });
     for (const line of lines) console.log(line);
     process.exitCode = exitCode;

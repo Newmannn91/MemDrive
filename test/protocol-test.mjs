@@ -4273,6 +4273,224 @@ async function main() {
       }
     });
 
+    // ---- 0.9.0 review fixes ----
+    const tryFileSymlink = async (target, linkPath) => {
+      try {
+        await fs.symlink(target, linkPath, 'file');
+        return true;
+      } catch (err) {
+        if (err.code === 'EPERM' || err.code === 'EACCES') {
+          console.log('  (skipped: no privilege to create a file symlink on this machine)');
+          return false;
+        }
+        throw err;
+      }
+    };
+
+    await check('0.9.0 fix: a file symlink is never a duplicate keeper and its target is never archived', async () => {
+      const rawLibDir = path.join(scratch, 'fix-symdup-lib');
+      await fs.mkdir(path.join(rawLibDir, 'a'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'z'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'fix-symdup-cache');
+      try {
+        const { buildCleanupPlan } = await import('../dist/tools.js');
+        await fs.writeFile(path.join(libDir, 'z', 'real.md'), '# real note\n\nbody text\n');
+        if (!(await tryFileSymlink(path.join(libDir, 'z', 'real.md'), path.join(libDir, 'a', 'link.md')))) return;
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await idx.buildAll();
+        const { plan } = await buildCleanupPlan(ctx);
+        assert.deepEqual(plan.actions.map((a) => a.path), [], JSON.stringify(plan.actions));
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 fix: an image referenced through a symlink is not an orphan', async () => {
+      const rawLibDir = path.join(scratch, 'fix-symorphan-lib');
+      await fs.mkdir(path.join(rawLibDir, 'img'), { recursive: true });
+      await fs.mkdir(path.join(rawLibDir, 'notes'), { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'fix-symorphan-cache');
+      try {
+        const { buildCleanupPlan } = await import('../dist/tools.js');
+        const old = new Date(Date.now() - 25 * 60 * 60 * 1000);
+        const realImg = path.join(libDir, 'img', 'b.png');
+        await fs.writeFile(realImg, 'fake-png');
+        await fs.utimes(realImg, old, old);
+        if (!(await tryFileSymlink(realImg, path.join(libDir, 'img', 'a.png')))) return;
+        await fs.writeFile(path.join(libDir, 'notes', 'n.md'), '# N\n\n![x](../img/a.png)\n');
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await idx.buildAll();
+        const { plan } = await buildCleanupPlan(ctx);
+        const paths = plan.actions.map((a) => a.path);
+        assert.ok(!paths.includes('img/b.png'), `symlink target proposed: ${paths}`);
+        assert.ok(!paths.includes('img/a.png'), `symlink proposed: ${paths}`);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 fix: a filename with a backslash never invalidates the whole plan (POSIX)', async () => {
+      if (process.platform === 'win32') return; // '\\' cannot appear in a Windows filename
+      const rawLibDir = path.join(scratch, 'fix-backslash-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const cacheBase = path.join(scratch, 'fix-backslash-cache');
+      process.env['MEMDRIVE_CACHE_DIR'] = cacheBase;
+      try {
+        const { handlePlanCleanup, runApplyCleanup } = await import('../dist/tools.js');
+        await fs.writeFile(path.join(libDir, 'a\\b.txt'), '');
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await idx.buildAll();
+        const res = await handlePlanCleanup(ctx);
+        const m = textOf(res).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m, textOf(res));
+        assert.ok(!textOf(res).includes('a\\b.txt'));
+        const { lines } = await runApplyCleanup(m[1], ctx);
+        const out = lines.join('\n');
+        assert.ok(!out.includes('Plan file is invalid'), out);
+        assert.ok(out.includes('executed: archive empty.txt'), out);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 fix: re-applying an executed plan reports "already applied"; future createdAt is rejected', async () => {
+      const rawLibDir = path.join(scratch, 'fix-reapply-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      process.env['MEMDRIVE_CACHE_DIR'] = path.join(scratch, 'fix-reapply-cache');
+      try {
+        const { handlePlanCleanup, runApplyCleanup } = await import('../dist/tools.js');
+        const { resolveIndexCacheDir } = await import('../dist/config.js');
+        const backend = new LocalStorageBackend(libDir);
+        const idx = new LocalSearchIndex(libDir, libDir, backend);
+        const ctx = { backend, rootDir: libDir, rootRealDir: libDir, searchIndex: idx };
+        await fs.writeFile(path.join(libDir, 'empty.txt'), '');
+        await idx.buildAll();
+        const m = textOf(await handlePlanCleanup(ctx)).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m);
+        const first = await runApplyCleanup(m[1], ctx);
+        assert.equal(first.exitCode, 0, first.lines.join('\n'));
+        const second = await runApplyCleanup(m[1], ctx);
+        assert.equal(second.exitCode, 1);
+        assert.ok(second.lines.join('\n').includes('already applied'), second.lines.join('\n'));
+
+        await fs.writeFile(path.join(libDir, 'empty2.txt'), '');
+        const m2 = textOf(await handlePlanCleanup(ctx)).match(/Cleanup plan (\S+) \(/);
+        assert.ok(m2);
+        const planPath = path.join(resolveIndexCacheDir(libDir), `plan-${m2[1]}.json`);
+        const planObj = JSON.parse(await fs.readFile(planPath, 'utf8'));
+        planObj.createdAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+        await fs.writeFile(planPath, JSON.stringify(planObj));
+        const future = await runApplyCleanup(m2[1], ctx);
+        assert.equal(future.exitCode, 1);
+        assert.ok(future.lines.join('\n').includes('in the future'));
+        assert.equal(await backend.exists('empty2.txt'), true);
+      } finally {
+        delete process.env['MEMDRIVE_CACHE_DIR'];
+      }
+    });
+
+    await check('0.9.0 fix: moveFile keeps the target when the source vanishes before unlink', async () => {
+      const rawLibDir = path.join(scratch, 'fix-move-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const backend = new LocalStorageBackend(libDir);
+      await fs.writeFile(path.join(libDir, 'src.txt'), 'only copy');
+      const origUnlink = fs.unlink;
+      const srcAbs = path.join(libDir, 'src.txt');
+      // Simulate a sync client moving the source away between link and unlink.
+      fs.unlink = async (p) => {
+        if (p === srcAbs) {
+          fs.unlink = origUnlink;
+          await origUnlink(p);
+          const err = new Error('ENOENT: simulated');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return origUnlink(p);
+      };
+      try {
+        await backend.moveFile('src.txt', 'archive/src.txt');
+      } finally {
+        fs.unlink = origUnlink;
+      }
+      assert.equal(await fs.readFile(path.join(libDir, 'archive', 'src.txt'), 'utf8'), 'only copy');
+    });
+
+    await check('0.9.0 fix: moveFile keeps the new source when the source is replaced before unlink', async () => {
+      const rawLibDir = path.join(scratch, 'fix-move-replaced-lib');
+      await fs.mkdir(rawLibDir, { recursive: true });
+      const libDir = await fs.realpath(rawLibDir);
+      const backend = new LocalStorageBackend(libDir);
+      const srcAbs = path.join(libDir, 'src.txt');
+      await fs.writeFile(srcAbs, 'original content');
+      const origLink = fs.link;
+      const origCopyFile = fs.copyFile;
+      const replaceSource = async () => {
+        const tmpAbs = path.join(libDir, '.sync-tmp');
+        await fs.writeFile(tmpAbs, 'new content');
+        await fs.rename(tmpAbs, srcAbs);
+      };
+      // Simulate a sync client replacing the source right after target creation.
+      fs.link = async (...args) => {
+        await origLink(...args);
+        if (args[0] === srcAbs) {
+          fs.link = origLink;
+          await replaceSource();
+        }
+      };
+      fs.copyFile = async (...args) => {
+        await origCopyFile(...args);
+        if (args[0] === srcAbs) {
+          fs.copyFile = origCopyFile;
+          await replaceSource();
+        }
+      };
+      try {
+        await backend.moveFile('src.txt', 'archive/src.txt');
+      } finally {
+        fs.link = origLink;
+        fs.copyFile = origCopyFile;
+      }
+      assert.equal(await fs.readFile(path.join(libDir, 'archive', 'src.txt'), 'utf8'), 'original content');
+      assert.equal(await fs.readFile(srcAbs, 'utf8'), 'new content');
+
+      // Also verify symlinks are checked by lstat (link identity), not target identity.
+      const targetAbs = path.join(libDir, 'target.txt');
+      const symAbs = path.join(libDir, 'sym.txt');
+      await fs.writeFile(targetAbs, 'target content');
+      if (await tryFileSymlink('target.txt', symAbs)) {
+        const origSymlink = fs.symlink;
+        const destSymAbs = path.join(libDir, 'archive', 'sym.txt');
+        fs.symlink = async (...args) => {
+          await origSymlink(...args);
+          if (args[1] === destSymAbs) {
+            fs.symlink = origSymlink;
+            await fs.unlink(symAbs);
+            await fs.writeFile(symAbs, 'replaced symlink');
+          }
+        };
+        try {
+          await backend.moveFile('sym.txt', 'archive/sym.txt');
+        } finally {
+          fs.symlink = origSymlink;
+        }
+        assert.equal((await fs.lstat(destSymAbs)).isSymbolicLink(), true);
+        assert.equal(await fs.readFile(destSymAbs, 'utf8'), 'target content');
+        assert.equal(await fs.readFile(symAbs, 'utf8'), 'replaced symlink');
+      }
+    });
+
     await check('0.9.0 apply (CLI): a duplicate whose keeper was deleted after planning is skipped', async () => {
       const rawLibDir = path.join(scratch, 'apply-cli-dupdelkeeper-lib');
       await fs.mkdir(rawLibDir, { recursive: true });
@@ -4373,6 +4591,7 @@ async function main() {
         delete process.env['MEMDRIVE_CACHE_DIR'];
       }
     });
+
 
     await check('0.9.0 apply_plan (MCP): executes archive from a plan', async () => {
       const rawLibDir = path.join(scratch, 'apply-mcp-a-lib');

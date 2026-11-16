@@ -72,7 +72,8 @@ async function realLocation(target, realpath, lstat, readlink, depth = 0) {
                     const lst = await lstat(current);
                     if (lst.isSymbolicLink()) {
                         const linkTarget = await readlink(current);
-                        const resolvedLink = path.resolve(path.dirname(current), String(linkTarget));
+                        const parentReal = await realLocation(path.dirname(current), realpath, lstat, readlink, depth + 1);
+                        const resolvedLink = path.resolve(parentReal, String(linkTarget));
                         const realTarget = await realLocation(resolvedLink, realpath, lstat, readlink, depth + 1);
                         let result = realTarget;
                         for (let i = missing.length - 1; i >= 0; i -= 1) {

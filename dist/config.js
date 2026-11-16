@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
 /** Server version (single source of truth; index.ts and net-guard.ts import it). */
-export const VERSION = '0.9.0';
+export const VERSION = '0.9.1';
 /** Maximum text payload returned by read_file. Larger files are truncated. */
 export const TEXT_MAX_BYTES = 1_000_000;
 /**

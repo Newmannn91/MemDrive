@@ -16,10 +16,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { z } from 'zod';
 import { IMAGE_PREVIEW_MAX_BYTES, READ_MAX_IMAGES, SAVE_IMAGES_MAX_DOWNLOAD_BYTES, SAVE_IMAGES_MAX_TOTAL_BYTES, SAVE_MAX_IMAGES, SEARCH_MAX_RESULTS, SVG_EXTENSION, TEXT_MAX_BYTES, resolveIndexCacheDir, resolveResponseBudgetBytes, resolveSearchMaxBytes, } from './config.js';
-import { MemDriveError, NotFoundError } from './errors.js';
+import { MemDriveError, NotFoundError, SandboxError } from './errors.js';
 import { acquireImage, base64Length, detectImageMime, encodeImageSrc, extensionForMime, makePreview, maxBinaryForBase64Budget, mimeFromExtension, scanMarkdownImages, } from './images.js';
-import { assertInsideRealRoot, decodeUserPath, isInside, sandboxPath, sandboxPathForWrite, toDisplayPath, } from './sandbox.js';
-import { LocalSearchIndex, MARKDOWN_EXTENSIONS, } from './search-index.js';
+import { assertInsideRealRoot, isInside, sandboxPath, sandboxPathForWrite, toDisplayPath, } from './sandbox.js';
+import { LocalSearchIndex, MARKDOWN_EXTENSIONS, canonicalRelPath, isUnderCanonicalScope, } from './search-index.js';
 import { openFolderInViewer, openInViewer } from './viewer.js';
 /** True when a path must never appear in a cleanup plan: any
     path segment starting with '.', or anything under archive/.
@@ -35,8 +35,18 @@ function isSkippedPlanPath(p) {
     never proposed in a plan, because apply could not
     execute it. */
 async function isWritablePlanPath(ctx, p) {
+    // Same lexical rules apply uses (isSafePlanPath): a path apply
+    // would reject (for example a Linux filename containing '\')
+    // must never be proposed, or it would invalidate the whole plan.
+    if (!isSafePlanPath(p))
+        return false;
     try {
-        await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, p);
+        const abs = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, p);
+        // cleanPath trims whitespace and strips quotes; a path that
+        // changes under normalization would make apply act on a
+        // different file, so it is never proposed.
+        if (toDisplayPath(ctx.rootDir, abs) !== p)
+            return false;
         await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, `archive/${p}`);
         return true;
     }
@@ -44,8 +54,25 @@ async function isWritablePlanPath(ctx, p) {
         return false;
     }
 }
+/** True when the path itself is a symlink (lstat), or cannot be
+    lstat'ed. Symlinks are never archived and never kept as a
+    duplicate keeper: their content/mtime mirror the target, so
+    archiving the target would leave the "kept" copy dangling. */
+async function isSymlinkPath(ctx, p) {
+    try {
+        return (await fs.lstat(path.join(ctx.rootRealDir, p))).isSymbolicLink();
+    }
+    catch {
+        return true;
+    }
+}
+const PLAN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+/** Clock-skew allowance for a plan whose createdAt is in the future. */
+const PLAN_FUTURE_SKEW_MS = 5 * 60 * 1000;
 export async function buildCleanupPlan(ctx) {
     const diag = await ctx.searchIndex.scanDiagnostics();
+    const statWarnings = [];
+    const seenWarningPaths = new Set();
     const statAndHash = async (p) => {
         try {
             const st = await ctx.backend.stat(p);
@@ -63,7 +90,17 @@ export async function buildCleanupPlan(ctx) {
                 return null;
             return { sha256, mtimeMs };
         }
-        catch {
+        catch (error) {
+            const code = error.code;
+            if (code === 'ENOENT' || code === 'ENOTDIR') {
+                return null;
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`[memdrive] plan_cleanup stat/hash failed for ${p}: ${message}`);
+            if (!seenWarningPaths.has(p)) {
+                seenWarningPaths.add(p);
+                statWarnings.push(`Skipped ${p} during plan verification (${message}).`);
+            }
             return null;
         }
     };
@@ -74,6 +111,8 @@ export async function buildCleanupPlan(ctx) {
         if (isSkippedPlanPath(p))
             continue;
         if (!(await isWritablePlanPath(ctx, p)))
+            continue;
+        if (await isSymlinkPath(ctx, p))
             continue;
         const info = await statAndHash(p);
         if (info === null)
@@ -95,6 +134,12 @@ export async function buildCleanupPlan(ctx) {
         const entries = [];
         for (const p of group) {
             if (isSkippedPlanPath(p))
+                continue;
+            // Filter before choosing the keeper: the keeper must be a real
+            // file whose path apply accepts, never a symlink.
+            if (!isSafePlanPath(p))
+                continue;
+            if (await isSymlinkPath(ctx, p))
                 continue;
             const info = await statAndHash(p);
             if (info !== null) {
@@ -132,6 +177,8 @@ export async function buildCleanupPlan(ctx) {
             continue;
         if (!(await isWritablePlanPath(ctx, p)))
             continue;
+        if (await isSymlinkPath(ctx, p))
+            continue;
         const info = await statAndHash(p);
         if (info === null)
             continue;
@@ -168,6 +215,7 @@ export async function buildCleanupPlan(ctx) {
                 ? [`Broken image references (${diag.brokenImageRefs.length}) need manual fixing; no file action is proposed for them.`]
                 : []),
             ...(withheldLine === null ? [] : [withheldLine]),
+            ...statWarnings,
         ].join('\n')
         : [
             `Cleanup plan ${planId} (${actions.length} actions):`,
@@ -180,17 +228,46 @@ export async function buildCleanupPlan(ctx) {
                 ? ['- Plan limit reached (200 actions); apply this batch, then run plan_cleanup again for the next batch.']
                 : []),
             ...(withheldLine === null ? [] : [`- ${withheldLine}`]),
+            ...statWarnings.map((w) => `- ${w}`),
         ].join('\n');
     return { plan: { planId, createdAt, actions }, preview };
 }
 export async function handlePlanCleanup(ctx) {
     const { plan, preview } = await buildCleanupPlan(ctx);
+    const cacheDir = resolveIndexCacheDir(ctx.rootRealDir);
+    await pruneOldPlans(cacheDir);
     if (plan.actions.length > 0) {
-        const cacheDir = resolveIndexCacheDir(ctx.rootRealDir);
         await fs.mkdir(cacheDir, { recursive: true, mode: 0o700 });
         await fs.writeFile(path.join(cacheDir, `plan-${plan.planId}.json`), JSON.stringify(plan, null, 2), { encoding: 'utf8', mode: 0o600 });
     }
     return okResult(preview);
+}
+/** Best-effort: delete plan files (pending or applied) older than
+    the 7-day validity window, so the cache dir does not grow
+    forever. Never fails the caller. */
+async function pruneOldPlans(cacheDir) {
+    let names;
+    try {
+        names = await fs.readdir(cacheDir);
+    }
+    catch {
+        return;
+    }
+    const now = Date.now();
+    for (const name of names) {
+        if (!/^plan-\d{14}-[0-9a-f]{6}(\.applied)?\.json$/.test(name))
+            continue;
+        const full = path.join(cacheDir, name);
+        try {
+            const st = await fs.stat(full);
+            if (now - st.mtimeMs > PLAN_MAX_AGE_MS) {
+                await fs.unlink(full);
+            }
+        }
+        catch {
+            // Ignore: pruning is housekeeping only.
+        }
+    }
 }
 export async function handleApplyPlan(ctx, planId) {
     const { lines, exitCode } = await runApplyCleanup(planId.trim(), ctx, { incrementalRefresh: true });
@@ -272,6 +349,17 @@ export async function runApplyCleanup(planId, ctx, options) {
     }
     catch (error) {
         if (error.code === 'ENOENT') {
+            const appliedPath = path.join(cacheDir, `plan-${planId}.applied.json`);
+            try {
+                await fs.access(appliedPath);
+                return {
+                    lines: [`Plan already applied: ${planId}. Run plan_cleanup again for a fresh plan.`],
+                    exitCode: 1,
+                };
+            }
+            catch {
+                // Not applied either: genuinely unknown.
+            }
             return { lines: [`Plan not found: ${planId}`], exitCode: 1 };
         }
         return { lines: [`Plan file is invalid: ${planId}`], exitCode: 1 };
@@ -287,8 +375,14 @@ export async function runApplyCleanup(planId, ctx, options) {
         return { lines: [`Plan file is invalid: ${planId}`], exitCode: 1 };
     }
     const createdMs = Date.parse(parsed.createdAt);
-    if (!Number.isFinite(createdMs) || Date.now() - createdMs > 7 * 24 * 60 * 60 * 1000) {
+    const ageMs = Date.now() - createdMs;
+    if (!Number.isFinite(createdMs) || ageMs > PLAN_MAX_AGE_MS) {
         return { lines: [`Plan expired: ${planId} (plans are valid for 7 days)`], exitCode: 1 };
+    }
+    if (ageMs < -PLAN_FUTURE_SKEW_MS) {
+        // A createdAt in the future (clock moved back, or a hand-edited
+        // plan) would otherwise never expire.
+        return { lines: [`Plan file is invalid: ${planId} (createdAt is in the future)`], exitCode: 1 };
     }
     const lines = [];
     let executed = 0;
@@ -314,9 +408,14 @@ export async function runApplyCleanup(planId, ctx, options) {
             recordSkipped(action, 'path not allowed for writing');
             continue;
         }
-        action.path = toDisplayPath(ctx.rootDir, absolute);
-        if (isSkippedPlanPath(action.path)) {
+        // Never rewrite the path: cleanPath trims/strips quotes, so a
+        // normalized path that differs names a different file.
+        if (toDisplayPath(ctx.rootDir, absolute) !== action.path || isSkippedPlanPath(action.path)) {
             recordSkipped(action, 'path not allowed for writing');
+            continue;
+        }
+        if (await isSymlinkPath(ctx, action.path)) {
+            recordSkipped(action, 'path is a symlink (symlinks are never archived)');
             continue;
         }
         let st;
@@ -368,8 +467,12 @@ export async function runApplyCleanup(planId, ctx, options) {
                 noLongerReason = 'no longer an empty file';
         }
         else if (action.kind === 'orphan') {
-            if (!diag.orphanCandidates.includes(action.path))
+            if (diag.scanIncomplete) {
+                noLongerReason = `orphan scan withheld: ${diag.skippedNotes.length} note(s) could not be read, so the image cannot be proven unreferenced`;
+            }
+            else if (!diag.orphanCandidates.includes(action.path)) {
                 noLongerReason = 'no longer an orphan attachment candidate';
+            }
         }
         else if (action.kind === 'duplicate') {
             const keeper = action.keeper ?? null;
@@ -389,6 +492,11 @@ export async function runApplyCleanup(planId, ctx, options) {
                 }
                 if (!keeperExists) {
                     noLongerReason = 'keeper no longer on disk';
+                }
+                else if (await isSymlinkPath(ctx, keeper)) {
+                    // A symlink keeper mirrors its target: archiving the target
+                    // would leave the "kept" copy dangling.
+                    noLongerReason = 'keeper is a symlink';
                 }
                 else if (!diag.duplicateGroups.some((g) => g.includes(action.path) && g.includes(keeper))) {
                     noLongerReason = 'no longer a duplicate of its keeper';
@@ -443,6 +551,16 @@ export async function runApplyCleanup(planId, ctx, options) {
         }
     }
     const allSkipped = executed === 0 && skipped > 0;
+    if (executed > 0) {
+        // Retire the plan so a second apply reports "already applied"
+        // instead of a confusing all-skipped error. Best-effort.
+        try {
+            await fs.rename(planPath, path.join(cacheDir, `plan-${planId}.applied.json`));
+        }
+        catch {
+            // Leave the plan in place; a re-run just skips every action.
+        }
+    }
     lines.push(`Applied plan ${planId}: ${executed} executed, ${skipped} skipped.` +
         (allSkipped ? ' All actions were skipped; nothing was executed.' : ''));
     return { lines, exitCode: allSkipped ? 1 : 0 };
@@ -495,6 +613,12 @@ const DIRECT_IMAGE_HEADER_RESERVE_BYTES = 512;
  * in read_file or edit_tags, preventing multi-GB files from exhausting RAM.
  */
 const MAX_READ_FILE_BYTES = 256_000_000;
+const NOTES_HEADER = '\n\n[MemDrive notes]\n';
+function formatNotesSection(notes) {
+    return notes.length > 0
+        ? `${NOTES_HEADER}${notes.map((n) => `- ${n}`).join('\n')}`
+        : '';
+}
 /**
  * Assemble the text block of a read_file result so that
  * text bytes + `imageBase64Total` never exceed `budget`. The body is
@@ -510,25 +634,16 @@ function assembleText(body, notes, budget, imageBase64Total) {
     if (notes.length === 0) {
         return truncateUtf8(body, allowedTextBytes);
     }
-    const notesSection = `\n\n[MemDrive notes]\n${notes.map((n) => `- ${n}`).join('\n')}`;
+    const notesSection = formatNotesSection(notes);
     const notesBytes = utf8Bytes(notesSection);
     const bodyBytes = utf8Bytes(body);
     if (bodyBytes + notesBytes <= allowedTextBytes) {
         return body + notesSection;
     }
-    if (imageBase64Total === 0) {
-        if (notesBytes >= allowedTextBytes) {
-            return truncateUtf8(notesSection, allowedTextBytes);
-        }
-        return truncateUtf8(body, allowedTextBytes - notesBytes) + notesSection;
+    if (notesBytes >= allowedTextBytes) {
+        return truncateUtf8(notesSection, allowedTextBytes);
     }
-    // When images are included, text body is guaranteed first; notes use remaining text allowance.
-    const fittedBody = truncateUtf8(body, allowedTextBytes);
-    const remainingForNotes = allowedTextBytes - utf8Bytes(fittedBody);
-    if (remainingForNotes <= 0) {
-        return fittedBody;
-    }
-    return fittedBody + truncateUtf8(notesSection, remainingForNotes);
+    return truncateUtf8(body, allowedTextBytes - notesBytes) + notesSection;
 }
 function timestampStem(date) {
     const pad = (n, width = 2) => String(n).padStart(width, '0');
@@ -587,7 +702,8 @@ export function formatDiagnostics(diag, scope) {
             lines.push(`- ${n.file} (${n.reason})`);
         }
         if (scope !== undefined && scope !== '') {
-            const outsideScope = diag.skippedNotes.filter((n) => n.file !== scope && !n.file.startsWith(`${scope}/`));
+            const canonScope = canonicalRelPath(scope);
+            const outsideScope = diag.skippedNotes.filter((n) => !isUnderCanonicalScope(n.file, canonScope));
             if (outsideScope.length > 0) {
                 lines.push(`Note: ${outsideScope.length} of the skipped note(s) above lie outside the requested scope (${scope}), but a note anywhere in the library may reference an image inside the scope, so they still withhold the orphan list.`);
             }
@@ -834,27 +950,37 @@ async function handleSaveFile(ctx, inputPath, content, mode, imageSpecs) {
     if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
         throw new MemDriveError('INVALID_ARGUMENT', `Cannot write into archive/ (${rel}). Use restore_file to bring it back first.`);
     }
-    if (mode === 'new' && (await ctx.backend.exists(rel))) {
-        throw new MemDriveError('ALREADY_EXISTS', `File already exists: ${rel}. Use mode "overwrite" to replace it or "append" to add to it.`);
+    const existingStat = await ctx.backend.stat(rel);
+    if (existingStat !== null) {
+        if (existingStat.isDirectory) {
+            throw new MemDriveError('NOT_A_FILE', `${rel} is a directory. Use list_directory to see its contents.`);
+        }
+        if (mode === 'new') {
+            throw new MemDriveError('ALREADY_EXISTS', `File already exists: ${rel}. Use mode "overwrite" to replace it or "append" to add to it.`);
+        }
     }
     const docExt = path.extname(absolute).toLowerCase();
     const docStem = path.basename(absolute, path.extname(absolute));
     const docDirRel = path.dirname(rel) === '.' ? '' : path.dirname(rel).split(path.sep).join('/');
-    // 1. Acquire images first (bytes in memory). Failures become notes;
-    //    they never block the text save. At most SAVE_MAX_IMAGES specs
-    //    are attempted, and everything kept together must fit the
-    //    per-save stored-image budget while downloads together must
-    //    fit the download-traffic budget. Hitting the count cap or
-    //    exhausting the stored budget stops the loop with a note
-    //    naming the cap; an exhausted download budget only refuses
-    //    further URL fetches, local and clipboard images can still
-    //    be acquired.
+    // 1–2. Acquire and persist each image one at a time into the sibling
+    //      assets/ folder so multiple large images are never held in memory
+    //      simultaneously. Failures become notes; they never block the
+    //      text save. At most SAVE_MAX_IMAGES specs are attempted, and
+    //      everything kept together must fit the per-save stored-image
+    //      budget while downloads together must fit the download-traffic
+    //      budget.
     const notes = [];
-    const acquired = [];
+    const savedImages = [];
     const budget = {
         storedRemainingBytes: SAVE_IMAGES_MAX_TOTAL_BYTES,
         downloadRemainingBytes: SAVE_IMAGES_MAX_DOWNLOAD_BYTES,
     };
+    const assetsRel = docDirRel === '' ? 'assets' : `${docDirRel}/assets`;
+    const stamp = timestampStem(new Date());
+    const safeStem = truncateUtf8(docStem, 200);
+    let assetsChecked = false;
+    let assetsOk = true;
+    let assetsDirEnsured = false;
     const specs = imageSpecs ?? [];
     for (let i = 0; i < specs.length; i++) {
         const spec = specs[i];
@@ -863,61 +989,68 @@ async function handleSaveFile(ctx, inputPath, content, mode, imageSpecs) {
             break;
         }
         const result = await acquireImage(spec, budget);
-        if (result.ok) {
-            acquired.push(result.image);
+        if (!result.ok) {
+            notes.push(`Image ${JSON.stringify(spec)} skipped: ${result.note}`);
         }
         else {
-            notes.push(`Image ${JSON.stringify(spec)} skipped: ${result.note}`);
+            if (!assetsChecked) {
+                assetsChecked = true;
+                // The doc path was sandbox-checked, but the assets folder was
+                // not: a symlink inside the library could point it outside, and
+                // the images would be written outside the root. Refuse the
+                // images with a note; the text still saves.
+                try {
+                    await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, assetsRel);
+                }
+                catch {
+                    assetsOk = false;
+                    notes.push('Images were not stored: the assets folder links outside the library.');
+                    break;
+                }
+            }
+            if (assetsOk) {
+                if (!assetsDirEnsured) {
+                    await ctx.backend.ensureDir(assetsRel);
+                    assetsDirEnsured = true;
+                }
+                const image = result.image;
+                const ext = extensionForMime(image.mimeType);
+                let stored = false;
+                let lastError;
+                for (let attempt = 1; attempt <= 10_000; attempt++) {
+                    const candidate = attempt === 1
+                        ? `${safeStem}-${stamp}.${ext}`
+                        : `${safeStem}-${stamp}-${attempt}.${ext}`;
+                    try {
+                        await ctx.backend.writeFile(`${assetsRel}/${candidate}`, image.data, 'new');
+                        savedImages.push({
+                            fileName: candidate,
+                            relPath: `${assetsRel}/${candidate}`,
+                            alt: image.baseName,
+                        });
+                        stored = true;
+                        break;
+                    }
+                    catch (error) {
+                        const isAlreadyExists = (error instanceof MemDriveError && error.code === 'ALREADY_EXISTS') ||
+                            error.code === 'EEXIST';
+                        lastError = error;
+                        if (isAlreadyExists) {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                if (!stored) {
+                    const message = lastError instanceof Error ? lastError.message : String(lastError);
+                    notes.push(`Image ${image.baseName} could not be stored: ${message}`);
+                }
+            }
         }
         // The stored budget is exhausted: stop the loop instead of
         // producing one refusal note per remaining spec.
         if (budget.storedRemainingBytes <= 0) {
             break;
-        }
-    }
-    // 2. Persist acquired images into the sibling assets/ folder with
-    //    unique docname+timestamp names. A failed image write is a note,
-    //    not a failed save.
-    const savedImages = [];
-    if (acquired.length > 0) {
-        const assetsRel = docDirRel === '' ? 'assets' : `${docDirRel}/assets`;
-        // The doc path was sandbox-checked, but the assets folder was
-        // not: a symlink inside the library could point it outside, and
-        // the images would be written outside the root. Refuse the
-        // images with a note; the text still saves.
-        let assetsOk = true;
-        try {
-            await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, assetsRel);
-        }
-        catch {
-            assetsOk = false;
-            notes.push('Images were not stored: the assets folder links outside the library.');
-        }
-        if (assetsOk) {
-            await ctx.backend.ensureDir(assetsRel);
-            const stamp = timestampStem(new Date());
-            const safeStem = truncateUtf8(docStem, 200);
-            for (const image of acquired) {
-                const ext = extensionForMime(image.mimeType);
-                let candidate = `${safeStem}-${stamp}.${ext}`;
-                let attempt = 1;
-                while (await ctx.backend.exists(`${assetsRel}/${candidate}`)) {
-                    attempt += 1;
-                    candidate = `${safeStem}-${stamp}-${attempt}.${ext}`;
-                }
-                try {
-                    await ctx.backend.writeFile(`${assetsRel}/${candidate}`, image.data, 'new');
-                    savedImages.push({
-                        fileName: candidate,
-                        relPath: `${assetsRel}/${candidate}`,
-                        alt: image.baseName,
-                    });
-                }
-                catch (error) {
-                    const message = error instanceof Error ? error.message : String(error);
-                    notes.push(`Image ${image.baseName} could not be stored: ${message}`);
-                }
-            }
         }
     }
     // 3. Build the document body. Markdown references are appended only for
@@ -1256,16 +1389,49 @@ function parseFmTags(fmBody) {
         };
     }
     // Plain value: comma-separated, with an optional trailing comment.
-    const commentMatch = /(^|\s)#/.exec(rest);
-    const itemsPart = commentMatch === null
-        ? rest
-        : rest.slice(0, commentMatch.index);
-    const suffix = commentMatch === null
+    // Quotes only open at the start of an item (YAML rule), so a
+    // mid-token apostrophe (`Bob's idea # c`) does not swallow `,` or `#`.
+    let quote = null;
+    let atItemStart = true;
+    let itemStart = 0;
+    let commentIdx = -1;
+    let commentHasLeadWs = false;
+    const rawItems = [];
+    for (let j = 0; j < rest.length; j++) {
+        const ch = rest[j];
+        if (quote !== null) {
+            if (quote === '"' && ch === '\\') {
+                j++;
+            }
+            else if (ch === quote) {
+                quote = null;
+            }
+        }
+        else if ((ch === '"' || ch === "'") && atItemStart) {
+            quote = ch;
+            atItemStart = false;
+        }
+        else if (ch === '#' &&
+            (j === 0 || rest[j - 1] === ' ' || rest[j - 1] === '\t')) {
+            commentIdx = j === 0 ? 0 : j - 1;
+            commentHasLeadWs = j > 0;
+            break;
+        }
+        else if (ch === ',') {
+            rawItems.push(rest.slice(itemStart, j));
+            itemStart = j + 1;
+            atItemStart = true;
+        }
+        else if (ch !== ' ' && ch !== '\t') {
+            atItemStart = false;
+        }
+    }
+    const itemsEnd = commentIdx === -1 ? rest.length : commentIdx;
+    rawItems.push(rest.slice(itemStart, itemsEnd));
+    const suffix = commentIdx === -1
         ? ''
-        : (commentMatch[1] === '' ? ' ' : '') +
-            rest.slice(commentMatch.index);
-    const tags = itemsPart
-        .split(',')
+        : (commentHasLeadWs ? '' : ' ') + rest.slice(commentIdx);
+    const tags = rawItems
         .map((p) => readTag(p))
         .filter((t) => t.length > 0);
     if (tags.some((t) => !isFrontMatterStorable(t))) {
@@ -1717,31 +1883,76 @@ async function resolveImageAbs(ctx, noteRel, noteAbs, ref) {
     // `path.resolve` treats `\` as an ordinary filename character, so
     // the image would report ENOENT while diagnostics (which
     // normalizes) calls it valid.
+    // scanMarkdownImages already percent-decoded ref.src once, so do NOT
+    // decode again (or strip `?` eagerly): a second decode breaks literal
+    // `%` filenames carrying `?query`, and unconditional `?` stripping
+    // turns a missing `missing?file.png` into an unrelated `missing` file.
     const src = ref.src.replace(/\\/g, '/');
-    const decoded = decodeUserPath(src);
     const toAbs = (p) => p.startsWith('/')
         ? path.resolve(ctx.rootDir, ...p.replace(/^\/+/, '').split('/'))
         : path.resolve(path.dirname(noteAbs), p);
-    // Prefer the literal path when it exists (a file can legitimately
-    // contain `%` in its name); otherwise use the decoded form.
-    if (decoded !== src) {
-        const rawAbs = toAbs(src);
-        try {
-            const rawRel = relOf(ctx, rawAbs);
-            if (isInside(ctx.rootDir, rawAbs) &&
-                (await ctx.backend.exists(rawRel === '.' ? '' : rawRel))) {
-                return { abs: rawAbs };
+    const rawAbs = toAbs(src);
+    const queryAt = src.indexOf('?');
+    if (queryAt !== -1) {
+        const probeRegularFile = async (abs) => {
+            if (!isInside(ctx.rootDir, abs)) {
+                return { status: 'result', value: { abs } };
+            }
+            try {
+                await assertInsideRealRoot(ctx.rootRealDir, abs);
+                const rel = relOf(ctx, abs);
+                const st = await ctx.backend.stat(rel === '.' ? '' : rel);
+                return st !== null && !st.isDirectory
+                    ? { status: 'hit' }
+                    : { status: 'miss' };
+            }
+            catch (error) {
+                if (error instanceof SandboxError) {
+                    return { status: 'result', value: { abs } };
+                }
+                const message = error instanceof Error ? error.message : String(error);
+                return { status: 'result', value: { reason: message } };
+            }
+        };
+        const rawCheck = await probeRegularFile(rawAbs);
+        if (rawCheck.status === 'result') {
+            return rawCheck.value;
+        }
+        if (rawCheck.status === 'hit') {
+            return { abs: rawAbs };
+        }
+        // Literal path did not resolve to a regular file; fall back to
+        // stripping the query suffix only when the stripped target looks
+        // like an image path and exists as a regular file inside the real root.
+        const strippedSrc = src.slice(0, queryAt);
+        if (strippedSrc !== '' &&
+            strippedSrc !== '.' &&
+            !strippedSrc.endsWith('/') &&
+            (mimeFromExtension(strippedSrc) !== null ||
+                path.extname(strippedSrc).toLowerCase() === SVG_EXTENSION)) {
+            const strippedAbs = toAbs(strippedSrc);
+            if (isInside(ctx.rootDir, strippedAbs)) {
+                const strippedCheck = await probeRegularFile(strippedAbs);
+                if (strippedCheck.status === 'result') {
+                    return strippedCheck.value;
+                }
+                if (strippedCheck.status === 'hit') {
+                    return { abs: strippedAbs };
+                }
             }
         }
-        catch {
-            // Fall through to the decoded form.
-        }
     }
-    return { abs: toAbs(decoded) };
+    return { abs: rawAbs };
 }
 /* ------------------------------------------------------------------ */
 /* read_file                                                           */
 /* ------------------------------------------------------------------ */
+function canonicalImageKey(relPath) {
+    const nfc = relPath.normalize('NFC');
+    return process.platform === 'darwin' || process.platform === 'win32'
+        ? nfc.toLowerCase()
+        : nfc;
+}
 async function handleReadFile(ctx, inputPath, includeImages) {
     // One total budget governs the whole response: text bytes + base64
     // bytes of every image block, counted together. Text is guaranteed
@@ -1776,7 +1987,9 @@ async function handleReadFile(ctx, inputPath, includeImages) {
         const notReturned = (reason) => okResult(truncateUtf8(`Image: ${rel} (${formatBytes(data.length)} on disk) was not returned as an image: ${reason} The original file was not modified.`, budget));
         let preview = await makePreview(data, mimeType, effectiveCap);
         if (preview === null) {
-            return notReturned(`it could not be downscaled to fit the ${formatBytes(budget)} total response budget (format not supported by the built-in decoder, or still over budget at minimum size).`);
+            return notReturned(data.length <= effectiveCap || detectImageMime(data) === null
+                ? 'the file is corrupt or not a valid image.'
+                : `it could not be downscaled to fit the ${formatBytes(budget)} total response budget (format not supported by the built-in decoder, or still over budget at minimum size).`);
         }
         const buildHeader = (shown) => shown.data.length < data.length
             ? `Image: ${rel} (${formatBytes(data.length)} on disk; preview downscaled to ${formatBytes(shown.data.length)} to fit the ${formatBytes(budget)} total response budget, original untouched).`
@@ -1824,7 +2037,8 @@ async function handleReadFile(ctx, inputPath, includeImages) {
     const effectiveTextCap = Math.min(TEXT_MAX_BYTES, budget);
     const notes = [];
     let body = fullText;
-    if (utf8Bytes(body) > effectiveTextCap) {
+    const bodyTruncated = utf8Bytes(body) > effectiveTextCap;
+    if (bodyTruncated) {
         notes.push(`Text truncated to the ${formatBytes(effectiveTextCap)} read cap; the file on disk is untouched.`);
         body = truncateUtf8(body, effectiveTextCap);
     }
@@ -1871,10 +2085,13 @@ async function handleReadFile(ctx, inputPath, includeImages) {
                 }
             }
             const listingSection = `\n\n[MemDrive referenced images — read each one separately with read_file on its path for full quality]\n${listed.join('\n')}`;
-            const notesSection = notes.length > 0
-                ? `\n\n[MemDrive notes]\n${notes.map((n) => `- ${n}`).join('\n')}`
-                : '';
-            const suffix = notesSection + listingSection;
+            let notesSection = formatNotesSection(notes);
+            let suffix = notesSection + listingSection;
+            if (!bodyTruncated && body.length > 0 && utf8Bytes(body) + utf8Bytes(suffix) > budget) {
+                notes.push(`Text truncated to fit the ${formatBytes(budget)} total response budget; the file on disk is untouched.`);
+                notesSection = formatNotesSection(notes);
+                suffix = notesSection + listingSection;
+            }
             if (utf8Bytes(suffix) >= budget) {
                 return okResult(truncateUtf8(suffix, budget));
             }
@@ -1887,11 +2104,18 @@ async function handleReadFile(ctx, inputPath, includeImages) {
         let imageBase64Total = 0;
         let included = 0;
         const runningTextBytes = utf8Bytes(body);
-        for (const ref of refs) {
-            if (included >= READ_MAX_IMAGES) {
-                notes.push(`Only the first ${READ_MAX_IMAGES} referenced images were included; the document references more.`);
-                break;
-            }
+        const docDirRel = path.dirname(rel) === '.' ? '' : path.dirname(rel).split(path.sep).join('/');
+        const docDirBytes = utf8Bytes(docDirRel);
+        const notesHeaderBytes = utf8Bytes(NOTES_HEADER);
+        const limitNoteBytes = utf8Bytes(`- Only the first ${READ_MAX_IMAGES} referenced images were included; the document references more.\n`);
+        const suffixSkipBytes = new Array(refs.length + 1).fill(0);
+        for (let j = refs.length - 1; j >= 0; j--) {
+            const r = refs[j];
+            const est = 220 + utf8Bytes(r.src) * 2 + docDirBytes + 128;
+            suffixSkipBytes[j] = (suffixSkipBytes[j + 1] ?? 0) + est;
+        }
+        for (let i = 0; i < refs.length; i++) {
+            const ref = refs[i];
             const resolved = await resolveImageAbs(ctx, rel, absolute, ref);
             if ('reason' in resolved) {
                 notes.push(`Skipped image ${ref.src}: ${resolved.reason}.`);
@@ -1905,10 +2129,15 @@ async function handleReadFile(ctx, inputPath, includeImages) {
                 }
                 await assertInsideRealRoot(ctx.rootRealDir, imageAbs);
                 const imageRel = relOf(ctx, imageAbs);
-                if (seenImageRels.has(imageRel)) {
+                const imageKey = canonicalImageKey(imageRel);
+                if (seenImageRels.has(imageKey)) {
                     continue;
                 }
-                seenImageRels.add(imageRel);
+                if (included >= READ_MAX_IMAGES) {
+                    notes.push(`Only the first ${READ_MAX_IMAGES} referenced images were included; the document references more.`);
+                    break;
+                }
+                seenImageRels.add(imageKey);
                 const imageStat = await ctx.backend.stat(imageRel === '.' ? '' : imageRel);
                 if (imageStat === null) {
                     notes.push(`Skipped image ${ref.src}: it is no longer on disk.`);
@@ -1922,40 +2151,73 @@ async function handleReadFile(ctx, inputPath, includeImages) {
                     notes.push(`Skipped image ${ref.src}: it is too large to read (${formatBytes(imageStat.size)}; limit is ${formatBytes(MAX_READ_FILE_BYTES)}).`);
                     continue;
                 }
-                const imageData = await ctx.backend.readFile(imageRel === '.' ? '' : imageRel);
                 const imageExt = path.extname(imageAbs).toLowerCase();
-                const mimeType = imageExt === SVG_EXTENSION
-                    ? null
-                    : (mimeFromExtension(imageAbs) ?? (imageExt === '' ? detectImageMime(imageData) : null));
+                const knownExtMime = imageExt === SVG_EXTENSION ? null : mimeFromExtension(imageAbs);
+                if (imageExt !== '' && knownExtMime === null) {
+                    notes.push(`Skipped referenced file with unsupported image type: ${ref.src}.`);
+                    continue;
+                }
+                const rawFutureSkipBytes = included + 1 >= READ_MAX_IMAGES
+                    ? (i + 1 < refs.length ? limitNoteBytes : 0)
+                    : (suffixSkipBytes[i + 1] ?? 0);
+                const futureNotesReserve = refs.length - 1 - i <= 40
+                    ? rawFutureSkipBytes
+                    : Math.min(rawFutureSkipBytes, Math.floor(Math.max(0, budget - runningTextBytes) * 0.5));
+                const currentNotesBytes = utf8Bytes(formatNotesSection(notes));
+                const headerIfEmpty = notes.length === 0 ? notesHeaderBytes : 0;
+                const downscaleReserve = utf8Bytes(`- Image ${ref.src} downscaled in memory to 999.99 MB to fit the response budget; original untouched.\n`);
+                const notesReserve = notes.length === 0
+                    ? headerIfEmpty + downscaleReserve + futureNotesReserve
+                    : currentNotesBytes + downscaleReserve + futureNotesReserve;
+                const remaining = budget - runningTextBytes - notesReserve - imageBase64Total;
+                const cap = Math.min(IMAGE_PREVIEW_MAX_BYTES, maxBinaryForBase64Budget(remaining));
+                const budgetSkipNote = remaining <= 0
+                    ? `Skipped image ${ref.src}: the ${formatBytes(budget)} total response budget is already used by the text. Read it directly with read_file on "${imageRel}" for full quality.`
+                    : cap <= 0
+                        ? `Skipped image ${ref.src}: no response budget remains after the text. Read it directly with read_file on "${imageRel}" for full quality.`
+                        : null;
+                if (knownExtMime !== null && budgetSkipNote !== null) {
+                    notes.push(budgetSkipNote);
+                    continue;
+                }
+                const imageData = await ctx.backend.readFile(imageRel === '.' ? '' : imageRel);
+                const mimeType = knownExtMime ?? (imageExt === '' ? detectImageMime(imageData) : null);
                 if (mimeType === null) {
                     notes.push(`Skipped referenced file with unsupported image type: ${ref.src}.`);
                     continue;
                 }
-                const currentNotesBytes = notes.length > 0
-                    ? utf8Bytes(`\n\n[MemDrive notes]\n${notes.map((n) => `- ${n}`).join('\n')}`)
-                    : 0;
-                const remaining = budget - runningTextBytes - currentNotesBytes - 256 - imageBase64Total;
-                if (remaining <= 0) {
-                    notes.push(`Skipped image ${ref.src}: the ${formatBytes(budget)} total response budget is already used by the text. Read it directly with read_file on "${imageRel}" for full quality.`);
-                    continue;
-                }
-                const cap = Math.min(IMAGE_PREVIEW_MAX_BYTES, maxBinaryForBase64Budget(remaining));
-                if (cap <= 0) {
-                    notes.push(`Skipped image ${ref.src}: no response budget remains after the text. Read it directly with read_file on "${imageRel}" for full quality.`);
+                if (budgetSkipNote !== null) {
+                    notes.push(budgetSkipNote);
                     continue;
                 }
                 const preview = await makePreview(imageData, mimeType, cap);
                 if (preview === null) {
-                    notes.push(`Skipped image ${ref.src} (${formatBytes(imageData.length)}): could not be downscaled to fit the remaining response budget; original untouched. Read it directly with read_file on "${imageRel}" — a direct read gives it the whole budget.`);
+                    notes.push(imageData.length <= cap || detectImageMime(imageData) === null
+                        ? `Skipped image ${ref.src} (${formatBytes(imageData.length)}): the file is corrupt or not a valid image; original untouched.`
+                        : `Skipped image ${ref.src} (${formatBytes(imageData.length)}): could not be downscaled to fit the remaining response budget; original untouched. Read it directly with read_file on "${imageRel}" — a direct read gives it the whole budget.`);
                     continue;
                 }
                 const encodedLength = base64Length(preview.data.length);
-                if (encodedLength > remaining) {
+                const downscaleNote = preview.data.length < imageData.length
+                    ? `Image ${ref.src} downscaled in memory to ${formatBytes(preview.data.length)} to fit the response budget; original untouched.`
+                    : null;
+                const notesAfterThis = downscaleNote !== null ? [...notes, downscaleNote] : notes;
+                const usedNotesAfterThisBytes = utf8Bytes(formatNotesSection(notesAfterThis));
+                const futureHeaderIfStillEmpty = notesAfterThis.length === 0 && futureNotesReserve > 0
+                    ? notesHeaderBytes
+                    : 0;
+                const exactRemaining = budget -
+                    runningTextBytes -
+                    usedNotesAfterThisBytes -
+                    futureHeaderIfStillEmpty -
+                    futureNotesReserve -
+                    imageBase64Total;
+                if (encodedLength > exactRemaining) {
                     notes.push(`Skipped image ${ref.src}: its downscaled preview still does not fit the remaining response budget; original untouched. Read it directly with read_file on "${imageRel}".`);
                     continue;
                 }
-                if (preview.data.length < imageData.length) {
-                    notes.push(`Image ${ref.src} downscaled in memory to ${formatBytes(preview.data.length)} to fit the response budget; original untouched.`);
+                if (downscaleNote !== null) {
+                    notes.push(downscaleNote);
                 }
                 imageBlocks.push({
                     type: 'image',
@@ -2382,7 +2644,7 @@ export function registerTools(server, backend, rootDir, rootRealDir, searchIndex
         description: [
             'Execute a cleanup plan created by plan_cleanup, by its plan ID. Archives each action in the plan (empty files, duplicate files, orphan attachments) after re-verifying it; nothing is ever permanently deleted.',
             'Before executing, each action is re-verified against the library: the path must still exist, the SHA-256 and modification time must match the plan, and the reason must still hold (empty file still empty, duplicate group still intact, orphan still unreferenced). Actions that no longer hold are skipped with the reason, and the rest still execute.',
-            'Plans older than 7 days are rejected. A plan ID that does not exist or is malformed is reported, and nothing is changed. The search index is rebuilt after execution.',
+            'Plans older than 7 days are rejected. A plan ID that does not exist or is malformed is reported, and nothing is changed. The search index is refreshed incrementally after execution, so the next search reflects the change. A plan that has been executed is retired; running it again reports that it was already applied.',
             'Use this when the user asks to execute a plan in chat (for example "执行这个清理计划"). The command-line `memdrive-mcp apply <plan-id>` does the same thing from a terminal.',
             'Never call this tool automatically right after plan_cleanup. Always show the user the plan preview and plan ID first and wait for their explicit confirmation in the chat before calling.',
         ].join('\n'),

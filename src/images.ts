@@ -14,8 +14,10 @@
  * cannot read (WebP, SVG) are passed through untouched when under the cap
  * and reported with a note when over it — never crashed on.
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import type http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 
 import { Jimp } from 'jimp';
@@ -154,6 +156,36 @@ const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 /** Maximum redirects followed for one image URL. */
 const MAX_REDIRECTS = 5;
 
+/** Switch large downloads to a temporary disk spool to avoid doubling memory on Buffer.concat. */
+const DOWNLOAD_SPOOL_THRESHOLD_BYTES = 8 * 1024 * 1024;
+/** Leading bytes needed by `detectImageMime`. */
+const HEAD_SNIFF_BYTES = 32;
+/** Minimum JPEG container header bytes emitted by jpeg-js; smaller budgets can never fit. */
+const MIN_JPEG_HEADER_BYTES = 512;
+
+function yieldLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+async function writeAll(fh: Awaited<ReturnType<typeof fs.open>>, buf: Buffer): Promise<void> {
+  let offset = 0;
+  while (offset < buf.byteLength) {
+    const { bytesWritten } = await fh.write(buf, offset, buf.byteLength - offset);
+    if (bytesWritten === 0) {
+      throw new Error('Short write to temporary download file');
+    }
+    offset += bytesWritten;
+  }
+}
+
+/** Destroy an HTTP response after attaching a defensive no-op 'error' listener. */
+function destroyResponse(res: http.IncomingMessage): void {
+  res.once('error', () => {});
+  res.destroy();
+}
+
 /** Download an image URL, streaming to memory with a safety ceiling. */
 async function downloadImage(
   url: string,
@@ -201,7 +233,7 @@ async function downloadImage(
       const location = Array.isArray(locationHeader)
         ? locationHeader[0]
         : locationHeader;
-      response.destroy();
+      destroyResponse(response);
       response = null;
       if (location === undefined || location === '') {
         return {
@@ -232,14 +264,18 @@ async function downloadImage(
   }
   const status = response.statusCode ?? 0;
   if (status < 200 || status >= 300) {
-    response.destroy();
+    destroyResponse(response);
     return {
       ok: false,
       note: `Could not download image URL ${url}: HTTP ${status}`,
     };
   }
   const chunks: Buffer[] = [];
+  const headChunks: Buffer[] = [];
+  let headBytes = 0;
   let total = 0;
+  let tmpPath: string | null = null;
+  let tmpHandle: Awaited<ReturnType<typeof fs.open>> | null = null;
   // The stream stops at whichever ceiling is lowest: the per-download
   // ceiling, the remaining download-traffic budget, or the remaining
   // stored-image budget (so an image too large to store is aborted
@@ -247,72 +283,125 @@ async function downloadImage(
   const downloadCap = budget?.downloadRemainingBytes ?? URL_DOWNLOAD_MAX_BYTES;
   const storedCap = budget?.storedRemainingBytes ?? URL_DOWNLOAD_MAX_BYTES;
   const ceiling = Math.min(URL_DOWNLOAD_MAX_BYTES, downloadCap, storedCap);
+  let data: Buffer;
   try {
-    for await (const chunk of response) {
-      const buf = chunk as Buffer;
-      total += buf.byteLength;
-      if (budget !== undefined) {
-        budget.downloadRemainingBytes = Math.max(
-          0,
-          budget.downloadRemainingBytes - buf.byteLength,
-        );
-      }
-      if (total > ceiling) {
-        response.destroy();
-        if (budget !== undefined && ceiling < URL_DOWNLOAD_MAX_BYTES) {
+    try {
+      for await (const chunk of response) {
+        const buf = chunk as Buffer;
+        total += buf.byteLength;
+        if (budget !== undefined) {
+          budget.downloadRemainingBytes = Math.max(
+            0,
+            budget.downloadRemainingBytes - buf.byteLength,
+          );
+        }
+        if (total > ceiling) {
+          destroyResponse(response);
+          if (budget !== undefined && ceiling < URL_DOWNLOAD_MAX_BYTES) {
+            return {
+              ok: false,
+              note:
+                downloadCap <= storedCap
+                  ? `${downloadBudgetNote()}.`
+                  : `${storedBudgetNote()}.`,
+            };
+          }
           return {
             ok: false,
-            note:
-              downloadCap <= storedCap
-                ? `${downloadBudgetNote()}.`
-                : `${storedBudgetNote()}.`,
+            note: `Image URL ${url} exceeds the ${URL_DOWNLOAD_MAX_BYTES} byte download safety ceiling.`,
           };
         }
+        if (headBytes < HEAD_SNIFF_BYTES) {
+          const take = Math.min(buf.byteLength, HEAD_SNIFF_BYTES - headBytes);
+          headChunks.push(Buffer.from(buf.subarray(0, take)));
+          headBytes += take;
+        }
+        if (tmpHandle !== null) {
+          await writeAll(tmpHandle, buf);
+        } else {
+          chunks.push(buf);
+          if (total > DOWNLOAD_SPOOL_THRESHOLD_BYTES) {
+            const candidatePath = path.join(
+              os.tmpdir(),
+              `memdrive-dl-${crypto.randomBytes(8).toString('hex')}`,
+            );
+            tmpHandle = await fs.open(candidatePath, 'wx+', 0o600);
+            tmpPath = candidatePath;
+            for (const c of chunks) {
+              await writeAll(tmpHandle, c);
+            }
+            chunks.length = 0;
+          }
+        }
+      }
+    } catch (error) {
+      destroyResponse(response);
+      const message = error instanceof Error ? error.message : String(error);
+      return { ok: false, note: `Download of image URL ${url} failed: ${message}` };
+    }
+    const rawContentType = response.headers['content-type'];
+    const contentTypeStr = Array.isArray(rawContentType)
+      ? rawContentType[0]
+      : rawContentType;
+    const headerType = contentTypeStr?.split(';')[0]?.trim().toLowerCase();
+    if (tmpHandle !== null && tmpPath !== null) {
+      await tmpHandle.close();
+      tmpHandle = null;
+      const head = Buffer.concat(headChunks, headBytes);
+      if (detectImageMime(head) === null) {
         return {
           ok: false,
-          note: `Image URL ${url} exceeds the ${URL_DOWNLOAD_MAX_BYTES} byte download safety ceiling.`,
+          note: `URL ${url} did not return image data (content-type: ${headerType ?? 'unknown'}).`,
         };
       }
-      chunks.push(buf);
+      if (budget !== undefined && total > budget.storedRemainingBytes) {
+        return { ok: false, note: `${storedBudgetNote()}.` };
+      }
+      try {
+        data = await fs.readFile(tmpPath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ok: false, note: `Download of image URL ${url} failed: ${message}` };
+      }
+    } else {
+      data = Buffer.concat(chunks, total);
+      chunks.length = 0;
     }
-  } catch (error) {
-    response.destroy();
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, note: `Download of image URL ${url} failed: ${message}` };
+    // Magic bytes are authoritative: a `200 OK` HTML error page or a
+    // 0-byte body served as `image/png` is not an image. detectImageMime
+    // recognizes all six raster formats this code supports, so dropping
+    // the Content-Type fallback excludes nothing legitimate.
+    const mimeType = detectImageMime(data);
+    if (mimeType === null) {
+      return {
+        ok: false,
+        note: `URL ${url} did not return image data (content-type: ${headerType ?? 'unknown'}).`,
+      };
+    }
+    // Only now, with a confirmed image, does the stored budget move:
+    // a failed or non-image download has already spent traffic, but
+    // must not block later legitimate images.
+    if (budget !== undefined && data.length > budget.storedRemainingBytes) {
+      return { ok: false, note: `${storedBudgetNote()}.` };
+    }
+    if (budget !== undefined) {
+      budget.storedRemainingBytes = Math.max(0, budget.storedRemainingBytes - data.length);
+    }
+    let stem = 'image';
+    try {
+      stem = baseNameOf(new URL(current).pathname);
+    } catch {
+      // Keep the default stem.
+    }
+    return { ok: true, image: { data, mimeType, baseName: stem } };
+  } finally {
+    if (tmpHandle !== null) {
+      await tmpHandle.close().catch(() => undefined);
+    }
+    if (tmpPath !== null) {
+      await fs.unlink(tmpPath).catch(() => undefined);
+    }
   }
-  const data = Buffer.concat(chunks);
-  const rawContentType = response.headers['content-type'];
-  const contentTypeStr = Array.isArray(rawContentType)
-    ? rawContentType[0]
-    : rawContentType;
-  const headerType = contentTypeStr?.split(';')[0]?.trim().toLowerCase();
-  // Magic bytes are authoritative: a `200 OK` HTML error page or a
-  // 0-byte body served as `image/png` is not an image. detectImageMime
-  // recognizes all six raster formats this code supports, so dropping
-  // the Content-Type fallback excludes nothing legitimate.
-  const mimeType = detectImageMime(data);
-  if (mimeType === null) {
-    return {
-      ok: false,
-      note: `URL ${url} did not return image data (content-type: ${headerType ?? 'unknown'}).`,
-    };
-  }
-  // Only now, with a confirmed image, does the stored budget move:
-  // a failed or non-image download has already spent traffic, but
-  // must not block later legitimate images.
-  if (budget !== undefined && data.length > budget.storedRemainingBytes) {
-    return { ok: false, note: `${storedBudgetNote()}.` };
-  }
-  if (budget !== undefined) {
-    budget.storedRemainingBytes = Math.max(0, budget.storedRemainingBytes - data.length);
-  }
-  let stem = 'image';
-  try {
-    stem = baseNameOf(new URL(current).pathname);
-  } catch {
-    // Keep the default stem.
-  }
-  return { ok: true, image: { data, mimeType, baseName: stem } };
 }
 
 /** Copy an image from a local OS path (outside the sandbox root is fine). */
@@ -461,13 +550,61 @@ export async function makePreview(
   if (maxBytes <= 0) {
     return null;
   }
+  const detectedMime = detectImageMime(data);
+  if (detectedMime === null) {
+    return null;
+  }
+  if (
+    data.length > maxBytes &&
+    (detectedMime === 'image/webp' || maxBytes < MIN_JPEG_HEADER_BYTES)
+  ) {
+    return null;
+  }
+  let image: Awaited<ReturnType<typeof Jimp.read>> | null = null;
+  if (detectedMime !== 'image/webp') {
+    try {
+      image = await Jimp.read(data);
+      if (image.width <= 0 || image.height <= 0) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
   if (data.length <= maxBytes) {
-    return { data, mimeType };
+    return { data, mimeType: detectedMime };
+  }
+  if (image === null) {
+    return null;
   }
   try {
-    const image = await Jimp.read(data);
-    let scale = 1;
-    for (;;) {
+    // Scale 1.0: spend budget on quality first (95, 90, 80) before shrinking.
+    for (const quality of IMAGE_PREVIEW_QUALITIES) {
+      const preview = await image.getBuffer(IMAGE_PREVIEW_MIME, { quality });
+      if (preview.length <= maxBytes) {
+        return { data: preview, mimeType: IMAGE_PREVIEW_MIME };
+      }
+    }
+    const tryMinQualities = async (
+      target: Awaited<ReturnType<typeof Jimp.read>>,
+    ): Promise<{ data: Buffer; mimeType: string } | null> => {
+      for (const quality of [60, 40, 20]) {
+        const smaller = await target.getBuffer(IMAGE_PREVIEW_MIME, { quality });
+        if (smaller.length <= maxBytes) {
+          return { data: smaller, mimeType: IMAGE_PREVIEW_MIME };
+        }
+      }
+      return null;
+    };
+    if (
+      image.width <= IMAGE_PREVIEW_MIN_DIMENSION &&
+      image.height <= IMAGE_PREVIEW_MIN_DIMENSION
+    ) {
+      return await tryMinQualities(image);
+    }
+    const steps: Array<{ width: number; height: number }> = [];
+    let scale = IMAGE_PREVIEW_SCALE_STEP;
+    while (scale > 1e-6) {
       const width = Math.max(
         IMAGE_PREVIEW_MIN_DIMENSION,
         Math.round(image.width * scale),
@@ -476,40 +613,51 @@ export async function makePreview(
         IMAGE_PREVIEW_MIN_DIMENSION,
         Math.round(image.height * scale),
       );
-      // At scale 1.0 there is nothing to resize: re-encode only.
-      // (Resize mutates in place, so branch on a single clone to keep
-      // one static type for `working`.)
-      const working = image.clone();
-      if (scale < 1) {
-        working.resize({ w: width, h: height });
+      const prev = steps[steps.length - 1];
+      if (prev === undefined || prev.width !== width || prev.height !== height) {
+        steps.push({ width, height });
       }
-      // At full resolution, spend the budget on quality first: try
-      // 95, then 90, then 80. Once shrinking starts, resolution
-      // matters more than quality, so smaller scales stay at 80.
-      const qualities =
-        scale === 1 ? IMAGE_PREVIEW_QUALITIES : [IMAGE_PREVIEW_QUALITY];
-      for (const quality of qualities) {
-        const preview = await working.getBuffer(IMAGE_PREVIEW_MIME, {
-          quality,
-        });
-        if (preview.length <= maxBytes) {
-          return { data: preview, mimeType: IMAGE_PREVIEW_MIME };
-        }
-      }
-      if (width <= IMAGE_PREVIEW_MIN_DIMENSION && height <= IMAGE_PREVIEW_MIN_DIMENSION) {
-        // Last resort: same minimum size, lower JPEG quality.
-        for (const quality of [60, 40, 20]) {
-          const smaller = await working.getBuffer(IMAGE_PREVIEW_MIME, {
-            quality,
-          });
-          if (smaller.length <= maxBytes) {
-            return { data: smaller, mimeType: IMAGE_PREVIEW_MIME };
-          }
-        }
-        return null;
+      if (
+        width <= IMAGE_PREVIEW_MIN_DIMENSION &&
+        height <= IMAGE_PREVIEW_MIN_DIMENSION
+      ) {
+        break;
       }
       scale *= IMAGE_PREVIEW_SCALE_STEP;
     }
+    if (steps.length === 0) {
+      return await tryMinQualities(image);
+    }
+    const lastStep = steps[steps.length - 1] as { width: number; height: number };
+    await yieldLoop();
+    const minWorking = image.clone();
+    minWorking.resize({ w: lastStep.width, h: lastStep.height });
+    const minBuf = await minWorking.getBuffer(IMAGE_PREVIEW_MIME, {
+      quality: IMAGE_PREVIEW_QUALITY,
+    });
+    if (minBuf.length > maxBytes) {
+      return await tryMinQualities(minWorking);
+    }
+    let best: Buffer = minBuf;
+    let lo = 0;
+    let hi = steps.length - 2;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const step = steps[mid] as { width: number; height: number };
+      await yieldLoop();
+      const working = image.clone();
+      working.resize({ w: step.width, h: step.height });
+      const candidate = await working.getBuffer(IMAGE_PREVIEW_MIME, {
+        quality: IMAGE_PREVIEW_QUALITY,
+      });
+      if (candidate.length <= maxBytes) {
+        best = candidate;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    return { data: best, mimeType: IMAGE_PREVIEW_MIME };
   } catch {
     return null;
   }
@@ -550,6 +698,44 @@ export function encodeImageSrc(src: string): string {
       ? `%${code.toString(16).toUpperCase().padStart(2, '0')}`
       : encodeURIComponent(ch);
   });
+}
+
+/** Strip CommonMark fenced code blocks (3+ backticks or tildes, <=3 spaces indent, CRLF-safe). */
+function stripFencedCode(text: string): string {
+  const out: string[] = [];
+  let fence: { ch: string; len: number } | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    const marker = m?.[1];
+    const info = m?.[2] ?? '';
+    if (fence === null) {
+      // A backtick fence's info string may not contain a backtick.
+      if (marker !== undefined && !(marker.startsWith('`') && info.includes('`'))) {
+        fence = { ch: marker.charAt(0), len: marker.length };
+        continue;
+      }
+    } else if (
+      marker !== undefined &&
+      marker.charAt(0) === fence.ch &&
+      marker.length >= fence.len &&
+      info.trim() === ''
+    ) {
+      fence = null;
+      continue;
+    }
+    if (fence === null) {
+      out.push(line);
+    }
+  }
+  return out.join('\n');
+}
+
+/** Strip fenced code blocks and inline code spans before scanning markdown syntax. */
+function stripMarkdownCode(text: string): string {
+  return stripFencedCode(text).replace(
+    /(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g,
+    ' ',
+  );
 }
 
 export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
@@ -604,33 +790,59 @@ export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
     seen.add(`${kind}:${trimmed}`);
     refs.push({ src: trimmed, kind });
   };
+  const stripped = stripMarkdownCode(markdown);
+  const matches: Array<{
+    index: number;
+    end: number;
+    priority: number;
+    src: string;
+    kind: MarkdownImageRef['kind'];
+  }> = [];
   const inlinePattern = /!\[(?:\\.|[^\]\\])*\]\(\s*(?:<([^>]*)>|([^\s)]+))(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
-  for (const match of markdown.matchAll(inlinePattern)) {
+  for (const match of stripped.matchAll(inlinePattern)) {
     const src = match[1] ?? match[2];
     if (src !== undefined) {
-      push(src, 'inline');
+      matches.push({
+        index: match.index,
+        end: match.index + match[0].length,
+        priority: 0,
+        src,
+        kind: 'inline',
+      });
     }
   }
   const imgPattern = /<img\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))/gi;
-  for (const match of markdown.matchAll(imgPattern)) {
+  for (const match of stripped.matchAll(imgPattern)) {
     const src = match[1] ?? match[2] ?? match[3];
     if (src !== undefined) {
-      push(src, 'img');
+      matches.push({
+        index: match.index,
+        end: match.index + match[0].length,
+        priority: 1,
+        src,
+        kind: 'img',
+      });
     }
   }
   // Obsidian embeds: `![[path.png]]` and `![[folder/img.png|alt]]`.
   const obsidianPattern = /!\[\[([^\]|]+)(?:\|[^\]]*)?\]\]/g;
-  for (const match of markdown.matchAll(obsidianPattern)) {
+  for (const match of stripped.matchAll(obsidianPattern)) {
     const src = match[1];
     if (src !== undefined) {
-      push(src, 'obsidian');
+      matches.push({
+        index: match.index,
+        end: match.index + match[0].length,
+        priority: 2,
+        src,
+        kind: 'obsidian',
+      });
     }
   }
   // Reference-style: collect `[id]: src` definitions first, then
   // resolve `![alt][id]` (and collapsed `![id][]`, where id = alt).
   // A definition may carry an optional title: `[id]: src "title"`.
   const refDefs = new Map<string, string>();
-  for (const match of markdown.matchAll(
+  for (const match of stripped.matchAll(
     /^\s*\[([^\]]+)\]:\s*(\S+)(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*$/gm,
   )) {
     const id = match[1];
@@ -640,14 +852,29 @@ export function scanMarkdownImages(markdown: string): MarkdownImageRef[] {
     }
   }
   const refPattern = /!\[(?:\\.|[^\]\\])*\]\[([^\]]*)\]/g;
-  for (const match of markdown.matchAll(refPattern)) {
+  for (const match of stripped.matchAll(refPattern)) {
     const idRaw = match[1] as string;
     const altMatch = /^!\[((?:\\.|[^\]\\])*)\]/.exec(match[0]);
     const id = idRaw.length > 0 ? idRaw : (altMatch?.[1] ?? '');
     const src = refDefs.get(id.toLowerCase());
     if (src !== undefined) {
-      push(src, 'reference');
+      matches.push({
+        index: match.index,
+        end: match.index + match[0].length,
+        priority: 3,
+        src,
+        kind: 'reference',
+      });
     }
+  }
+  matches.sort((a, b) => a.index - b.index || a.priority - b.priority);
+  let lastEnd = 0;
+  for (const item of matches) {
+    if (item.index < lastEnd) {
+      continue;
+    }
+    lastEnd = item.end;
+    push(item.src, item.kind);
   }
   return refs;
 }

@@ -75,6 +75,7 @@
  *     only how much the server sends, not how much the model
  *     sees inline; see the README budget table.
  */
+import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -410,13 +411,26 @@ export const claudeCodeAdapter: HostConfigAdapter = {
   serverKey: 'memdrive',
   responseBudgetBytes: RESPONSE_BUDGET_HOST_BYTES,
   findConfigPaths: async (deps: HostProbeDeps): Promise<string[]> => {
+    const platform = probePlatform(deps);
     const env = probeEnv(deps);
     const home = probeHome(deps);
-    const pathMod = pathModuleFor(probePlatform(deps));
+    const pathMod = pathModuleFor(platform);
     const override = env['CLAUDE_CONFIG_DIR']?.trim();
-    const configPath = override
-      ? pathMod.join(pathMod.resolve(home, override), '.claude.json')
-      : pathMod.join(home, '.claude.json');
+    let configDir = home;
+    if (override) {
+      let expanded = override;
+      if (expanded === '~') {
+        expanded = home;
+      } else if (expanded.startsWith('~/') || expanded.startsWith('~\\')) {
+        const tail =
+          platform === 'win32'
+            ? expanded.slice(2)
+            : expanded.slice(2).replace(/\\/g, '/');
+        expanded = pathMod.join(home, tail);
+      }
+      configDir = pathMod.resolve(home, expanded);
+    }
+    const configPath = pathMod.join(configDir, '.claude.json');
     return (await probeExists(deps, configPath)) ? [configPath] : [];
   },
 };
@@ -602,26 +616,50 @@ export type WriteConfigResult =
  * parameter is injectable for temp-dir tests; defaults to the real
  * filesystem.
  */
+const REQUIRED_HOST_CONFIG_FS_METHODS = [
+  'readFile',
+  'copyFile',
+  'access',
+  'mkdir',
+  'rename',
+  'unlink',
+  'open',
+  'stat',
+  'lstat',
+  'readlink',
+  'realpath',
+  'chmod',
+] as const;
+
 export async function writeHostConfig(
   adapter: HostConfigAdapter,
   configPath: string,
   entry: HostConfigEntry,
   fileSystem: {
     readFile: (path: string, encoding: 'utf8') => Promise<string>;
-    writeFile: (path: string, data: string, encoding: 'utf8') => Promise<void>;
-    copyFile: (src: string, dest: string) => Promise<void>;
+    writeFile?: (path: string, data: string, encoding: 'utf8') => Promise<void>;
+    copyFile: (src: string, dest: string, mode?: number) => Promise<void>;
     access: (path: string) => Promise<void>;
-    mkdir?: typeof fs.mkdir;
-    rename?: typeof fs.rename;
-    unlink?: typeof fs.unlink;
-    open?: typeof fs.open;
-    stat?: typeof fs.stat;
-    lstat?: typeof fs.lstat;
-    readlink?: typeof fs.readlink;
-    realpath?: typeof fs.realpath;
-    chmod?: typeof fs.chmod;
+    mkdir: typeof fs.mkdir;
+    rename: typeof fs.rename;
+    unlink: typeof fs.unlink;
+    open: typeof fs.open;
+    stat: typeof fs.stat;
+    lstat: typeof fs.lstat;
+    readlink: typeof fs.readlink;
+    realpath: typeof fs.realpath;
+    chmod: typeof fs.chmod;
   } = fs,
 ): Promise<WriteConfigResult> {
+  if (fileSystem !== fs) {
+    for (const method of REQUIRED_HOST_CONFIG_FS_METHODS) {
+      if (typeof Reflect.get(fileSystem, method) !== 'function') {
+        throw new TypeError(
+          `Custom fileSystem passed to writeHostConfig is missing required method: ${method}`,
+        );
+      }
+    }
+  }
   let existing: string;
   try {
     existing = await fileSystem.readFile(configPath, 'utf8');
@@ -634,15 +672,29 @@ export async function writeHostConfig(
           message: `Config file not found: ${configPath}. Nothing was written.`,
         };
       }
+      // readFile also throws ENOENT for a dangling symlink; refuse to
+      // follow it and create a target file somewhere else.
+      try {
+        const lst = await fileSystem.lstat(configPath);
+        if (lst.isSymbolicLink()) {
+          throw new Error(
+            `Refusing to create config through dangling symlink: ${configPath}`,
+          );
+        }
+      } catch (lstatError) {
+        const lstatCode = (lstatError as NodeJS.ErrnoException).code;
+        if (lstatCode !== 'ENOENT' && lstatCode !== 'ENOTDIR') {
+          throw lstatError;
+        }
+      }
       const created = {
         [adapter.serversKey]: { [adapter.serverKey]: entry },
       };
-      const mkdirFn = fileSystem.mkdir ?? fs.mkdir;
-      await mkdirFn(path.dirname(configPath), { recursive: true });
-      await fileSystem.writeFile(
+      await fileSystem.mkdir(path.dirname(configPath), { recursive: true });
+      await atomicWrite(
         configPath,
         `${JSON.stringify(created, null, 2)}\n`,
-        'utf8',
+        { fs: fileSystem },
       );
       return { status: 'created', configPath };
     }
@@ -660,11 +712,40 @@ export async function writeHostConfig(
       return false;
     }
   };
+  const tryCopyBackup = async (dest: string): Promise<boolean> => {
+    if (await backupExists(dest)) {
+      return false;
+    }
+    try {
+      await fileSystem.copyFile(configPath, dest, fsConstants.COPYFILE_EXCL);
+      return true;
+    } catch (copyError) {
+      if ((copyError as NodeJS.ErrnoException).code === 'EEXIST') {
+        return false;
+      }
+      throw copyError;
+    }
+  };
   const plainBackup = `${configPath}.bak`;
-  const backupPath = (await backupExists(plainBackup))
-    ? `${plainBackup}-${backupTimestamp(new Date())}`
-    : plainBackup;
-  await fileSystem.copyFile(configPath, backupPath);
+  let backupPath: string | null = null;
+  if (await tryCopyBackup(plainBackup)) {
+    backupPath = plainBackup;
+  } else {
+    const stamp = backupTimestamp(new Date());
+    for (let attempt = 1; attempt <= 10_000; attempt++) {
+      const candidate =
+        attempt === 1
+          ? `${plainBackup}-${stamp}`
+          : `${plainBackup}-${stamp}-${attempt}`;
+      if (await tryCopyBackup(candidate)) {
+        backupPath = candidate;
+        break;
+      }
+    }
+  }
+  if (backupPath === null) {
+    throw new Error(`Could not allocate a unique backup path for ${configPath}`);
+  }
   // Atomic replace via the shared helper (resolves symlinks,
   // preserves permissions, refuses read-only targets, fsyncs,
   // retries Windows locks). The temp file is removed if any step

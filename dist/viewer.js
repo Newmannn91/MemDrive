@@ -122,20 +122,42 @@ export async function openFolderInViewer(absolutePath, platform = process.platfo
     const { command, args } = folderCommandFor(platform, absolutePath);
     return launchViewer(command, args, absolutePath, platform);
 }
+function quoteWin32CmdValue(value) {
+    if (value.length === 0) {
+        return '""';
+    }
+    // cmd.exe treats space, tab, comma, semicolon, and equals as token
+    // delimiters (and parens/! can have special handling), whereas libuv's
+    // default quoting only wraps space, tab, and quote. Quote explicitly
+    // and pass windowsVerbatimArguments so paths like C:\a,b.png stay intact.
+    if (!/[\s,;=()!+]/.test(value)) {
+        return value;
+    }
+    return `"${value.replace(/\\+$/, '$&$&')}"`;
+}
+function formatWin32CmdArgs(args) {
+    return args.map((arg) => {
+        if (arg.startsWith('/n,')) {
+            return `/n,${quoteWin32CmdValue(arg.slice(3))}`;
+        }
+        return quoteWin32CmdValue(arg);
+    });
+}
 async function launchViewer(command, args, absolutePath, platform) {
     // On Windows the path is re-parsed by cmd.exe, so a filename
     // containing & | < > ^ % would split the command line and run a
-    // second command. (The header comment's "a crafted filename
-    // cannot inject a second command" is only true where no shell
-    // re-parses the line; cmd.exe does.) Refuse instead of launching.
+    // second command (and " would break out of explicit quoting). Refuse
+    // instead of launching.
     // NOTE: this is a refusal, not a new launch mechanism — switching
     // away from cmd entirely is a follow-up, not this round.
-    if (platform === 'win32' && /[\r\n&|<>^%]/.test(absolutePath)) {
+    if (platform === 'win32' && /[\r\n"&|<>^%]/.test(absolutePath)) {
         return {
             ok: false,
-            reason: `Refusing to open a path containing shell metacharacters (& | < > ^ % \\r \\n) on Windows: ${absolutePath}`,
+            reason: `Refusing to open a path containing shell metacharacters (& | < > ^ % " \\r \\n) on Windows: ${absolutePath}`,
         };
     }
+    const useVerbatimWin32 = platform === 'win32' && command === 'cmd.exe';
+    const spawnArgs = useVerbatimWin32 ? formatWin32CmdArgs(args) : args;
     return new Promise((resolve) => {
         let settled = false;
         const settle = (result) => {
@@ -155,10 +177,11 @@ async function launchViewer(command, args, absolutePath, platform) {
         timer.unref?.();
         let child;
         try {
-            child = spawn(command, args, {
+            child = spawn(command, spawnArgs, {
                 detached: true,
                 stdio: 'ignore',
                 windowsHide: true,
+                ...(useVerbatimWin32 ? { windowsVerbatimArguments: true } : {}),
             });
         }
         catch (error) {

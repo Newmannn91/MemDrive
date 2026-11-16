@@ -49,7 +49,7 @@ export type ClipboardResult =
 async function runBuffer(
   command: string,
   args: string[],
-): Promise<{ data: Buffer | null; ranOk: boolean; stderr: string }> {
+): Promise<{ data: Buffer | null; ranOk: boolean; stderr: string; tooLarge: boolean }> {
   try {
     const { stdout } = await execFileAsync(command, args, {
       encoding: 'buffer',
@@ -59,12 +59,14 @@ async function runBuffer(
       env: { ...process.env, LC_ALL: 'C' },
     });
     const out = stdout as Buffer;
-    return { data: out.length > 0 ? out : null, ranOk: true, stderr: '' };
+    return { data: out.length > 0 ? out : null, ranOk: true, stderr: '', tooLarge: false };
   } catch (error) {
-    const stderr = (
-      (error as { stderr?: Buffer | string }).stderr ?? ''
-    ).toString();
-    return { data: null, ranOk: false, stderr };
+    const err = error as { code?: unknown; message?: string; stderr?: Buffer | string };
+    const stderr = (err.stderr ?? '').toString();
+    const tooLarge =
+      err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' &&
+      !(err.message ?? '').startsWith('stderr');
+    return { data: null, ranOk: false, stderr, tooLarge };
   }
 }
 
@@ -179,7 +181,11 @@ async function readWindows(): Promise<ClipboardResult> {
     `if ($img -ne $null) { $img.Save('${tmp.replace(/'/g, "''")}', [System.Drawing.Imaging.ImageFormat]::Png); exit 0 }`,
     '$text = [System.Windows.Forms.Clipboard]::GetText()',
     'if ([string]::IsNullOrEmpty($text)) { exit 2 }',
-    '[Console]::Out.Write($text); exit 3',
+    '$bytes = [System.Text.Encoding]::UTF8.GetBytes($text)',
+    '$out = [Console]::OpenStandardOutput()',
+    '$out.Write($bytes, 0, $bytes.Length)',
+    '$out.Flush()',
+    'exit 3',
   ].join('; ');
   try {
     const { stdout } = await execFileAsync(
@@ -252,7 +258,13 @@ async function readLinux(): Promise<ClipboardResult> {
     ['xclip', ['-selection', 'clipboard', '-t', 'image/png', '-o']],
   ];
   for (const [command, args] of imageCommands) {
-    const { data, ranOk, stderr } = await runBuffer(command, args);
+    const { data, ranOk, stderr, tooLarge } = await runBuffer(command, args);
+    if (tooLarge) {
+      return {
+        kind: 'unsupported',
+        reason: `Clipboard image is too large (limit is ${CLIPBOARD_MAX_BYTES} bytes). Use a file path or image URL instead.`,
+      };
+    }
     anyRanOk = anyRanOk || ranOk || stderrMeansEmpty(stderr);
     if (data !== null) {
       const mimeType = detectImageMime(data);

@@ -8,6 +8,23 @@ earlier versions were delivered as zips and verified by the
 protocol suite (see TEST-REPORT.md). Each section below maps
 to a GitHub Release.
 
+## [0.9.1] - 2026-11-16
+
+Bug-fix release. A full-package review of the 0.9.0 code (Hydrogen, agy) found 30 issues — 6 high, 16 medium, 8 low; 22 confirmed, 8 partially confirmed, 0 false positives. All 30 are fixed here, verified against the code with the build passing and 215/215 tests green (including 6 new regression tests).
+
+### Fixed
+
+- **Search index concurrency.** `doRefresh` no longer races `buildAll`; the lock heartbeat no longer races `releaseLock`; a failed `buildAll` no longer leaves the index reporting `ready` while it is broken.
+- **Sandbox and symlinks.** `atomicWrite` no longer resolves a dangling relative symlink to a file outside the library; `sandboxPath` validates the path before stat and no longer swallows `SandboxError`; `walkTextFiles` blocks symlinks under `archive/`; archive detection is case-insensitive; the BFS walk visits real directories before symlinked aliases.
+- **Tags and front matter.** Plain-form quoted `#` tags (e.g. `tags: "a #b"`) are no longer truncated; a leading UTF-8 BOM no longer breaks front-matter parsing; flow-list comma splitting is fixed.
+- **Images.** `resolveImageRef` validates before stat; image URLs with a query string resolve correctly; the image scan skips fenced code blocks and preserves document order.
+- **Save and read.** Host-config backup no longer overwrites a backup made within the same millisecond and is created atomically; `saveFile` image names are collision-safe; `read_file` respects the notes budget; `saveFile` rejects an existing directory as its target; `readFile` boundary checks fixed.
+- **Search and scope.** The direct-scan fallback skips cloud placeholders and dot-directories; scope matching is case-insensitive on macOS/Windows; search errors are logged instead of silently swallowed.
+- **Network and system.** IPv6 `::ffff:0:0:0/96` is blocked from SSRF checks; `downloadImage` destroy has an error listener; the Windows viewer quotes `,`, `;`, `=` in paths; clipboard reads UTF-8 correctly and reports oversize instead of "empty".
+- **Other low-priority fixes.** Stat errors are logged instead of swallowed; large downloads spool to disk, preview scaling is bounded, and the file-text cache is capped (LRU, 64 items / 8M chars); `CLAUDE_CONFIG_DIR` `~` is expanded; `moveFile` preserves symlinks; index and wizard boundary validation.
+- **moveFile same-file hardening.** Before unlinking the source, `moveFile` verifies it is still the same file (device, inode, type, size, mtime); if a sync client replaced it mid-move, the new file is kept and the move still counts as done.
+- **Test file: CI macOS realpath fixes merged.** The 15 realpath spots from the CI fix (8 `rootRealDir`, 7 `resolveIndexCacheDir`) are now in the test file alongside the 6 new regression tests (5 from the 0.9.0 review fixes + 1 moveFile same-file test). Tests: 215/215 green on Linux.
+
 ## [0.9.0] - 2026-11-11
 
 Maintenance & archiving release. Part 1: tag editing (parts 2–3 — archive/restore and the two-step plan/apply cleanup — follow in the same release).
@@ -22,6 +39,14 @@ Maintenance & archiving release. Part 1: tag editing (parts 2–3 — archive/re
 - **apply_plan tool.** Execute a cleanup plan from chat, by its plan ID. Same re-verification and execution as the `memdrive-mcp apply <plan-id>` command (paths, SHA-256, and modification times are re-checked; actions that no longer hold are skipped; plans older than 7 days are rejected), but callable by the model in conversation — the user just asks to execute the plan in natural language, no terminal needed. The command-line `apply` is unchanged and still works.
 
 ### Fixed
+
+- **Cleanup review fixes (2026-11-15).**
+  - *Symlinks in cleanup plans.* A file symlink mirrors its target's content and mtime, so it used to form a "duplicate group" with its target; when the symlink sorted first it became the keeper and the real file was archived, leaving the kept copy dangling. Symlinks are now never proposed, never chosen as a keeper (filtered before the keeper is picked), and apply re-checks both the action path and the keeper with `lstat`. Diagnostics also records the real location of every image a note references through a symlink, so the symlink's target is no longer listed as an orphan.
+  - *Plan/apply path rules agree.* Plan generation now applies the same lexical rules as apply (`isSafePlanPath`) and refuses any path that changes under sandbox normalization (leading/trailing whitespace, surrounding quotes). Previously a legal POSIX filename containing `\` could enter a plan and make apply reject the whole plan as invalid, and a whitespace/quoted name was silently rewritten to a different path at apply time. Apply no longer rewrites `action.path`; a mismatch is skipped as "path not allowed for writing".
+  - *moveFile never destroys the only copy.* If the source vanishes (ENOENT) between creating the target and unlinking the source — for example a sync client moved it — the move now counts as done instead of "rolling back" by deleting the target, which had become the only copy.
+  - *Plan lifecycle.* A plan with at least one executed action is renamed to `plan-<id>.applied.json`; applying it again reports "Plan already applied" instead of an all-skipped error. Plan files older than 7 days are pruned when `plan_cleanup` runs. A plan whose `createdAt` is more than 5 minutes in the future is rejected (it would otherwise never expire).
+  - *Clearer skip reason.* When the orphan scan is withheld (a note could not be read), orphan actions are skipped with "orphan scan withheld: N note(s) could not be read" instead of the misleading "no longer an orphan attachment candidate".
+  - *apply_plan description.* Now says the index is refreshed incrementally (it never did a full rebuild).
 
 - **Hardening & edge cases.** `edit_tags` preserves a leading UTF-8 BOM; `search_files` reports out-of-range offsets cleanly, applies `file_types` before the 200-hit direct-scan cap, and guards background index warm-up against unhandled rejections; `save_file` escapes `]` in Markdown image alt text and cleans up saved images only when the document write itself fails; `read_file` and `edit_tags` reject files over 256 MB before loading them into memory.
 - **Cross-platform filename validation on write.** File names containing characters that are invalid on Windows (notably `:` and trailing dots or spaces) are rejected on write (`save_file`, `archive_file`, and `restore_file`), while files with such names that already exist in the library can still be read.

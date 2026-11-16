@@ -184,7 +184,8 @@ export function expandCustomPath(input, homeDir = homedir(), platform = process.
     if (!pathMod.isAbsolute(p)) {
         return null;
     }
-    if (platform === 'win32' && !/^(?:[a-zA-Z]:[\\/]|\\\\)/.test(p)) {
+    if (platform === 'win32' &&
+        !/^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/.test(p)) {
         return null;
     }
     return pathMod.normalize(p);

@@ -56,9 +56,9 @@ import {
   resolveIndexCacheDir,
   resolveIndexMaxFileBytes,
 } from './config.js';
-import { MemDriveError } from './errors.js';
+import { MemDriveError, SandboxError } from './errors.js';
 import { scanMarkdownImages, type MarkdownImageRef } from './images.js';
-import { isInside } from './sandbox.js';
+import { assertInsideRealRoot, isInside, toDisplayPath } from './sandbox.js';
 import type { StorageBackend } from './storage.js';
 
 /** Normalize text for indexing and querying: NFKC + lowercase. */
@@ -370,9 +370,11 @@ function isValidIndex(parsed: unknown): parsed is SerializedIndex {
       }
     }
     // Every posting must point at a real chunk (search skips a
-    // dangling one with no error).
+    // dangling one with no error). Reject non-canonical keys such as
+    // "" or whitespace that Number() coerces to 0.
     for (const idStr of Object.keys(perChunk)) {
-      if (!chunkIds.has(Number(idStr))) {
+      const id = Number(idStr);
+      if (!Number.isFinite(id) || String(id) !== idStr || !chunkIds.has(id)) {
         return false;
       }
     }
@@ -418,7 +420,6 @@ export function chunkText(text: string): Array<Omit<IndexChunk, 'id' | 'file' | 
   const units = splitUnits(text);
   const chunks: Array<{ startOffset: number; endOffset: number; section: string }> = [];
   let current: TextUnit[] = [];
-  let currentLen = 0;
   // Start offset of the current chunk. It may sit BEFORE the first
   // unit's start: when a chunk is cut, the next one re-opens with a
   // 100-char overlap tail from the previous chunk, so a phrase
@@ -440,7 +441,6 @@ export function chunkText(text: string): Array<Omit<IndexChunk, 'id' | 'file' | 
           flush(last.end);
         }
         current = [];
-        currentLen = 0;
       }
       flushHardSplit(unit, chunks);
       continue;
@@ -449,7 +449,6 @@ export function chunkText(text: string): Array<Omit<IndexChunk, 'id' | 'file' | 
       currentStart = unit.start;
       currentSection = unit.section;
       current = [unit];
-      currentLen = unitLen;
       continue;
     }
     // Length of the slice if this unit joins the chunk: the slice is
@@ -460,7 +459,6 @@ export function chunkText(text: string): Array<Omit<IndexChunk, 'id' | 'file' | 
       const last = current[current.length - 1];
       if (last === undefined) {
         current = [unit];
-        currentLen = unitLen;
         continue;
       }
       flush(last.end);
@@ -478,12 +476,9 @@ export function chunkText(text: string): Array<Omit<IndexChunk, 'id' | 'file' | 
       currentStart = nextStart;
       currentSection = unit.section;
       current = [unit];
-      // Exact length of the new chunk's slice so far.
-      currentLen = unit.end - nextStart;
       continue;
     }
     current.push(unit);
-    currentLen = unit.end - currentStart;
   }
   if (current.length > 0) {
     const last = current[current.length - 1];
@@ -598,8 +593,84 @@ function unescapeDoubleQuoted(inner: string): string {
   return out;
 }
 
+// Same helper as tools.ts `splitFlowItems` — the two copies must
+// stay in sync (this file cannot import from tools.ts: import cycle).
+/** Split the bracketed contents of a flow list, respecting quoted items (`"a,b"` is one item). */
+function splitFlowItems(inner: string): string[] {
+  const items: string[] = [];
+  let cur = '';
+  let quote: string | null = null;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i] as string;
+    if (quote === '"') {
+      // Inside double quotes a backslash escapes the next character.
+      cur += ch;
+      if (ch === '\\' && i + 1 < inner.length) {
+        cur += inner[i + 1] as string;
+        i++;
+      } else if (ch === '"') {
+        quote = null;
+      }
+    } else if (quote !== null) {
+      cur += ch;
+      if (ch === quote) {
+        quote = null;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+    } else if (ch === ',') {
+      items.push(cur);
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  items.push(cur);
+  return items;
+}
+
+/**
+ * Strip a trailing YAML comment from a trimmed block-list item while
+ * respecting leading single/double quotes (matching `tools.ts` `parseFmTags`).
+ */
+function stripBlockItemComment(trimmedItem: string): string {
+  let quote: string | null = null;
+  let commentIdx = -1;
+  for (let j = 0; j < trimmedItem.length; j++) {
+    const ch = trimmedItem[j] as string;
+    if (quote !== null) {
+      if (quote === '"' && ch === '\\') {
+        j++;
+      } else if (ch === quote) {
+        quote = null;
+      }
+    } else if ((ch === '"' || ch === "'") && j === 0) {
+      quote = ch;
+    } else if (
+      ch === '#' &&
+      (j === 0 || trimmedItem[j - 1] === ' ' || trimmedItem[j - 1] === '\t')
+    ) {
+      commentIdx = j;
+      break;
+    }
+  }
+  return (commentIdx === -1 ? trimmedItem : trimmedItem.slice(0, commentIdx)).trimEnd();
+}
+
+/** Strip a single leading UTF-8 BOM (`\uFEFF`) so front-matter matching and offsets match `TextDecoder`. */
+function stripLeadingBom(text: string): string {
+  return text.startsWith('\uFEFF') ? text.slice(1) : text;
+}
+
+/** Decode a UTF-8 buffer and strip a leading BOM (`\uFEFF`). */
+function decodeUtf8(data: Buffer): string {
+  return stripLeadingBom(data.toString('utf8'));
+}
+
 /** Extract tags: YAML front matter `tags:` + body `#tag`. Read-only. */
 export function extractTags(text: string): string[] {
+  const source = stripLeadingBom(text);
   const tags = new Set<string>();
   // Tags are case-insensitive and never keep a leading '#': a query
   // for `project` must match `#Project` and front matter `#project`.
@@ -631,7 +702,7 @@ export function extractTags(text: string): string[] {
   // value, not a tag called "comment"; `- alpha # c1` is "alpha".
   const stripYamlComment = (value: string): string =>
     value.replace(/(^|\s)#.*$/, '$1').trim();
-  const fm = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(source);
   if (fm !== null) {
     const body = fm[1] as string;
     // Inline form only: `[ \t]*` (not `\s*`) so the match cannot
@@ -649,7 +720,7 @@ export function extractTags(text: string): string[] {
       // regression.)
       const bracket = /^\[((?:[^\]"']|"(?:\\.|[^"\\])*"|'[^']*')*)\]/.exec(value);
       if (bracket !== null) {
-        for (const part of (bracket[1] as string).split(',')) {
+        for (const part of splitFlowItems(bracket[1] as string)) {
           addTag(part);
         }
       } else if (value.startsWith('[')) {
@@ -675,7 +746,7 @@ export function extractTags(text: string): string[] {
       for (const line of (block[1] as string).split('\n')) {
         const item = /^-\s*(.+?)\s*$/.exec(line.trim());
         if (item !== null) {
-          addTag(stripYamlComment(item[1] as string));
+          addTag(stripBlockItemComment(item[1] as string));
         }
       }
     }
@@ -686,7 +757,7 @@ export function extractTags(text: string): string[] {
   // pure number (`#123`) is not a tag. Inline code is stripped
   // first: a `#` inside `` `git commit #amend` `` is preceded by a
   // space, so without this it would be extracted as a tag.
-  let bodyText = text;
+  let bodyText = source;
   if (fm !== null) {
     bodyText = bodyText.slice((fm[0] as string).length);
   }
@@ -708,7 +779,8 @@ export function extractDate(
   fileName: string,
   mtimeMs: number,
 ): string | null {
-  const fm = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(text);
+  const source = stripLeadingBom(text);
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(source);
   if (fm !== null) {
     const dateLine = /^date:\s*(.+?)\s*$/m.exec(fm[1] as string);
     if (dateLine !== null) {
@@ -833,11 +905,20 @@ function looksLikeText(data: Buffer): boolean {
   return !data.subarray(0, 8192).includes(0);
 }
 
-function canonicalRelPath(p: string): string {
+export function canonicalRelPath(p: string): string {
   const nfc = p.normalize('NFC');
   return process.platform === 'darwin' || process.platform === 'win32'
     ? nfc.toLowerCase()
     : nfc;
+}
+
+/** True when `relPath` equals `canonScope` or lives beneath it (both canonicalized via `canonicalRelPath`). */
+export function isUnderCanonicalScope(relPath: string, canonScope: string): boolean {
+  if (canonScope === '') {
+    return true;
+  }
+  const canonPath = canonicalRelPath(relPath);
+  return canonPath === canonScope || canonPath.startsWith(`${canonScope}/`);
 }
 
 /** SHA-256 hex of a buffer. */
@@ -962,8 +1043,29 @@ export class LocalSearchIndex implements SearchIndex {
    * index was reloaded on every search and never rebuilt.
    */
   private distrustDisk = false;
+  /**
+   * True when the current in-memory index failed search or validation
+   * and has not yet been replaced by a valid load or rebuild. Tracked
+   * separately from `distrustDisk` and `totalChunks` so a failed
+   * rebuild before swap-in neither restores `'ready'` on a damaged
+   * index nor downgrades a healthy pure-image/empty index (`totalChunks === 0`).
+   */
+  private inMemoryDamaged = false;
   /** Next chunk id to hand out; only grows, never reused after a removal. */
   private nextChunkIdValue = 0;
+  /** True while a full rebuild (`buildAll`) is active in this process. */
+  private buildActive = false;
+  /** Monotonic counter bumped whenever `this.data` is replaced by `load` or `buildAll`. */
+  private buildEpoch = 0;
+  /** Serializes in-process callers that acquire the lock file and write `index.json`. */
+  private fileLockChain: Promise<void> = Promise.resolve();
+  /** Active/queued `persist()` promises for write coalescing. */
+  private persistInFlight: Promise<void> | null = null;
+  private persistQueued: Promise<void> | null = null;
+  /** Incremented by `markDirty` to detect edits made mid-build or mid-refresh. */
+  private dirtyCounter = 0;
+  private dirtyDuringBuild = new Set<string>();
+  private dirtyDuringRefresh = new Set<string>();
   /**
    * Random token written into the lock file when this process takes
    * it (see acquireLock). releaseLock only deletes the lock when
@@ -973,6 +1075,8 @@ export class LocalSearchIndex implements SearchIndex {
   private lockToken: string | null = null;
   /** Interval that renews the lock timestamp while we hold it (heartbeat). */
   private lockHeartbeat: NodeJS.Timeout | null = null;
+  /** Currently executing heartbeat tick, awaited by `releaseLock` before unlinking. */
+  private lockHeartbeatInFlight: Promise<void> | null = null;
   /**
    * When resolveNoteImageRef last waited for another process's
    * build to finish (see the cold-start wait there). A note with
@@ -1030,6 +1134,9 @@ export class LocalSearchIndex implements SearchIndex {
    * `building` status, and a `ready` index must keep its data.
    */
   public async load(): Promise<void> {
+    if (this.status === 'building' || this.buildActive || this.refreshPromise !== null) {
+      return;
+    }
     // Another process is mid-build (holds a fresh lock): do not load
     // the index it is about to replace — a later persist could write
     // our stale copy over the builder's fresh one. Stay unbuilt;
@@ -1037,8 +1144,14 @@ export class LocalSearchIndex implements SearchIndex {
     if (await this.isLockHeldByLiveProcess()) {
       return;
     }
+    if ((this.status as IndexStatus) === 'building' || this.buildActive || this.refreshPromise !== null) {
+      return;
+    }
     try {
       const raw = await fs.readFile(this.indexPath, 'utf8');
+      if ((this.status as IndexStatus) === 'building' || this.buildActive || this.refreshPromise !== null) {
+        return;
+      }
       const parsed = JSON.parse(raw) as SerializedIndex;
       if (!isValidIndex(parsed)) {
         return;
@@ -1066,6 +1179,8 @@ export class LocalSearchIndex implements SearchIndex {
       }
       this.nextChunkIdValue = maxId + 1;
       this.rebuildPostingsCount();
+      this.buildEpoch += 1;
+      this.inMemoryDamaged = false;
       this.status = 'ready';
     } catch {
       // Leave the status untouched (F2, see the doc comment above).
@@ -1157,10 +1272,42 @@ export class LocalSearchIndex implements SearchIndex {
       // Keep the configured root.
     }
     const visited = new Set<string>([rootRealDir]);
-    const queue: string[] = [''];
-    const pendingSymlinkDirs: Array<{ relPath: string; real: string }> = [];
-    while (queue.length > 0) {
-      const current = queue.shift() as string;
+    const archiveReals: string[] = [];
+    try {
+      const topEntries = await fs.readdir(this.rootDir, { withFileTypes: true });
+      for (const dirent of topEntries) {
+        if (dirent.name.toLowerCase() !== 'archive') {
+          continue;
+        }
+        const abs = path.join(this.rootDir, dirent.name);
+        try {
+          const st = await fs.stat(abs);
+          if (st.isDirectory()) {
+            const ar = await fs.realpath(abs);
+            archiveReals.push(ar);
+            visited.add(ar);
+          }
+        } catch {
+          // Vanished or broken link: ignore.
+        }
+      }
+    } catch {
+      // Unreadable root; listDirectory below reports it via onSkip.
+    }
+    const realQueue: string[] = [''];
+    const symlinkQueue: Array<{ relPath: string; real: string }> = [];
+    while (realQueue.length > 0 || symlinkQueue.length > 0) {
+      let current: string;
+      if (realQueue.length > 0) {
+        current = realQueue.shift() as string;
+      } else {
+        const next = symlinkQueue.shift() as { relPath: string; real: string };
+        if (visited.has(next.real) || archiveReals.some((ar) => isInside(ar, next.real))) {
+          continue;
+        }
+        visited.add(next.real);
+        current = next.relPath;
+      }
       let entries;
       try {
         entries = await this.backend.listDirectory(current);
@@ -1191,6 +1338,9 @@ export class LocalSearchIndex implements SearchIndex {
             if (!isInside(rootRealDir, real)) {
               continue;
             }
+            if (archiveReals.some((ar) => isInside(ar, real as string))) {
+              continue;
+            }
           } catch {
             onSkip?.(entry.relPath, 'symlink target unreadable');
             continue;
@@ -1199,11 +1349,14 @@ export class LocalSearchIndex implements SearchIndex {
         if (entry.type === 'directory') {
           // [Issue 6] Case-insensitive check for top-level archive/
           if (current === '' && entry.name.toLowerCase() === 'archive') {
-            // Record archive/'s realpath so a symlink into archive/
-            // is skipped too (it would otherwise walk archived files
-            // under a non-archive/ prefix).
+            // Record archive/'s realpath so symlinks into archive/ or any
+            // archive/ subdirectory are skipped too.
             try {
-              visited.add(await fs.realpath(path.join(this.rootDir, entry.relPath)));
+              const ar = real ?? (await fs.realpath(path.join(this.rootDir, entry.relPath)));
+              if (!archiveReals.includes(ar)) {
+                archiveReals.push(ar);
+              }
+              visited.add(ar);
             } catch {
               // Realpath failed: skip archive/ as before; the symlink
               // will be caught by its own realpath check if reachable.
@@ -1218,15 +1371,18 @@ export class LocalSearchIndex implements SearchIndex {
               onSkip?.(entry.relPath, 'realpath failed');
               continue;
             }
+            if (archiveReals.some((ar) => isInside(ar, real as string))) {
+              continue;
+            }
           }
           if (entry.isSymlink) {
-            // Defer symlink directories: a real directory to the same
-            // target, listed in the same parent, must win the visited
-            // race so walked files carry the real relPath.
-            pendingSymlinkDirs.push({ relPath: entry.relPath, real });
+            // Defer ALL symlink directories until every real (non-symlink)
+            // directory across the library has been walked, so a shallow
+            // symlink cannot steal `visited` from a deeper real directory.
+            symlinkQueue.push({ relPath: entry.relPath, real });
           } else if (!visited.has(real)) {
             visited.add(real);
-            queue.push(entry.relPath);
+            realQueue.push(entry.relPath);
           }
           continue;
         }
@@ -1262,13 +1418,6 @@ export class LocalSearchIndex implements SearchIndex {
           });
         }
       }
-      for (const pending of pendingSymlinkDirs) {
-        if (!visited.has(pending.real)) {
-          visited.add(pending.real);
-          queue.push(pending.relPath);
-        }
-      }
-      pendingSymlinkDirs.length = 0;
       // Yield between directories so a huge library never blocks the loop.
       await LocalSearchIndex.yieldLoop();
     }
@@ -1382,7 +1531,7 @@ export class LocalSearchIndex implements SearchIndex {
     if (!looksLikeText(data)) {
       return null;
     }
-    const text = data.toString('utf8');
+    const text = decodeUtf8(data);
     const { entry, chunks, postings } = this.indexFileContent(
       file.relPath,
       text,
@@ -1439,68 +1588,109 @@ export class LocalSearchIndex implements SearchIndex {
    * it apart from a lock.
    */
   public async buildAll(): Promise<BuildResult> {
-    const locked = await this.acquireLock();
-    if (!locked) {
+    if (this.buildActive) {
       return 'locked';
     }
-    this.status = 'building';
-    // True once the new index has been swapped in: a later failure
-    // is a write failure, and the swapped-in index is complete and
-    // usable even for an empty library (totalChunks 0).
-    let swappedIn = false;
+    this.buildActive = true;
     try {
-      const { files, allNames } = await this.walkTextFiles();
-      const next: SerializedIndex = {
-        version: INDEX_FORMAT_VERSION,
-        files: nullRecord<IndexedFile>(),
-        chunks: [],
-        postings: nullRecord<Record<string, number>>(),
-        totalChunks: 0,
-        avgChunkLen: 0,
-        updatedAt: new Date().toISOString(),
-        fileNames: allNames,
-      };
-      let nextChunkId = 0;
-      for (const file of files) {
-        const entry = await this.addFileToIndex(next, file, () => {
-          const id = nextChunkId;
-          nextChunkId += 1;
-          return id;
-        });
-        if (entry !== null) {
-          next.files[file.relPath] = entry;
+      return await this.withFileLockQueue(async () => {
+        const locked = await this.acquireLock();
+        if (!locked) {
+          return 'locked';
         }
-        await LocalSearchIndex.yieldLoop();
-      }
-      next.totalChunks = next.chunks.length;
-      let totalTokens = 0;
-      for (const chunk of next.chunks) {
-        totalTokens += chunk.tokenCount;
-      }
-      next.avgChunkLen = next.totalChunks > 0 ? totalTokens / next.totalChunks : 0;
-      this.data = next;
-      swappedIn = true;
-      this.rebuildPostingsCount();
-      this.nextChunkIdValue = nextChunkId;
-      this.status = 'ready';
-      await this.writeIndexFile();
-      // A fresh index is on disk now: the distrusted copy is gone.
-      this.distrustDisk = false;
-      return 'built';
-    } catch (error) {
-      // A failed build leaves the previous index (if any) in place;
-      // searches keep falling back to a direct scan. If the new
-      // index was already swapped in, it is complete and usable —
-      // only the write failed — so the status stays 'ready' even
-      // for an empty library (totalChunks 0).
-      this.status =
-        swappedIn || this.data.totalChunks > 0 ? 'ready' : 'unbuilt';
-      console.error(
-        `[memdrive] search index rebuild failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
-      return 'failed';
+        const prevStatus = this.status;
+        this.status = 'building';
+        // True once the new index has been swapped in: a later failure
+        // is a write failure, and the swapped-in index is complete and
+        // usable even for an empty or pure-image library (totalChunks 0).
+        let swappedIn = false;
+        try {
+          const startDirtyCounter = this.dirtyCounter;
+          this.dirtyDuringBuild.clear();
+          const { files, allNames } = await this.walkTextFiles();
+          const next: SerializedIndex = {
+            version: INDEX_FORMAT_VERSION,
+            files: nullRecord<IndexedFile>(),
+            chunks: [],
+            postings: nullRecord<Record<string, number>>(),
+            totalChunks: 0,
+            avgChunkLen: 0,
+            updatedAt: new Date().toISOString(),
+            fileNames: allNames,
+          };
+          let nextChunkId = 0;
+          for (const file of files) {
+            const entry = await this.addFileToIndex(next, file, () => {
+              const id = nextChunkId;
+              nextChunkId += 1;
+              return id;
+            });
+            if (entry !== null) {
+              next.files[file.relPath] = entry;
+            }
+            await LocalSearchIndex.yieldLoop();
+          }
+          next.totalChunks = next.chunks.length;
+          let totalTokens = 0;
+          for (const chunk of next.chunks) {
+            totalTokens += chunk.tokenCount;
+          }
+          next.avgChunkLen = next.totalChunks > 0 ? totalTokens / next.totalChunks : 0;
+          this.data = next;
+          swappedIn = true;
+          this.inMemoryDamaged = false;
+          this.buildEpoch += 1;
+          this.rebuildPostingsCount();
+          this.nextChunkIdValue = nextChunkId;
+          let droppedDirty = false;
+          for (const dirtyPath of this.dirtyDuringBuild) {
+            if (this.data.files[dirtyPath] !== undefined) {
+              this.removeFileFromIndex(dirtyPath);
+              droppedDirty = true;
+            }
+          }
+          this.dirtyDuringBuild.clear();
+          if (droppedDirty) {
+            this.recomputeTotals();
+          }
+          if (this.dirtyCounter === startDirtyCounter) {
+            this.needsRefresh = false;
+          }
+          await this.writeIndexFile(this.data);
+          this.status = 'ready';
+          // A fresh index is on disk now: the distrusted copy is gone.
+          this.distrustDisk = false;
+          return 'built';
+        } catch (error) {
+          // If the new index was already swapped in, it is complete and
+          // usable — only the write failed — so the status stays 'ready'
+          // even for an empty or pure-image library (totalChunks 0).
+          // Otherwise, only restore 'ready' when the previous index was
+          // genuinely healthy and ready; a damaged or unbuilt old index
+          // must stay 'unbuilt' so searches fall back to a direct scan.
+          if (swappedIn) {
+            this.status = 'ready';
+          } else {
+            const oldIndexHealthy =
+              prevStatus === 'ready' &&
+              !this.inMemoryDamaged &&
+              isValidIndex(this.data);
+            if (!oldIndexHealthy && prevStatus === 'ready') {
+              this.inMemoryDamaged = true;
+              this.distrustDisk = true;
+            }
+            this.status = oldIndexHealthy ? 'ready' : 'unbuilt';
+          }
+          console.error(
+            `[memdrive] search index rebuild failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          return 'failed';
+        } finally {
+          await this.releaseLock();
+        }
+      });
     } finally {
-      await this.releaseLock();
+      this.buildActive = false;
     }
   }
 
@@ -1520,7 +1710,7 @@ export class LocalSearchIndex implements SearchIndex {
     nowMs: number = Date.now(),
     opts?: { background?: boolean },
   ): Promise<void> {
-    if (this.status !== 'ready') {
+    if (this.status !== 'ready' || this.buildActive) {
       return Promise.resolve();
     }
     if (this.refreshPromise !== null) {
@@ -1544,13 +1734,19 @@ export class LocalSearchIndex implements SearchIndex {
     // One chain: keep passing until nothing was queued (or dirtied)
     // while a pass ran. Joiners wait on this same promise.
     const run = async (): Promise<void> => {
+      let passForced = forced;
       for (;;) {
         this.refreshQueued = false;
         this.lastRefreshMs = Date.now();
-        await this.doRefresh();
-        if (!this.refreshQueued && !this.needsRefresh) {
+        await this.doRefresh(passForced);
+        if (
+          this.status !== 'ready' ||
+          this.buildActive ||
+          (!this.refreshQueued && !this.needsRefresh)
+        ) {
           break;
         }
+        passForced = this.needsRefresh;
         this.needsRefresh = false;
       }
     };
@@ -1562,13 +1758,47 @@ export class LocalSearchIndex implements SearchIndex {
 
   /** A save just changed this file: drop its stale entry and make the next search refresh. */
   public markDirty(relPath: string): void {
+    const hadEntry = this.data.files[relPath] !== undefined;
     this.removeFileFromIndex(relPath);
+    if (hadEntry) {
+      this.recomputeTotals();
+    }
+    this.dirtyCounter += 1;
+    this.dirtyDuringBuild.add(relPath);
+    this.dirtyDuringRefresh.add(relPath);
     this.needsRefresh = true;
     this.lastRefreshMs = 0;
   }
 
-  private async doRefresh(): Promise<void> {
+  private async doRefresh(wasForced: boolean): Promise<void> {
+    if (this.status !== 'ready' || this.buildActive) {
+      if (wasForced) {
+        this.needsRefresh = true;
+      }
+      return;
+    }
+    const startEpoch = this.buildEpoch;
+    const startData = this.data;
+    this.dirtyDuringRefresh.clear();
+
+    const isStaleRun = (): boolean =>
+      this.buildActive ||
+      this.buildEpoch !== startEpoch ||
+      this.status !== 'ready' ||
+      this.data !== startData;
+
+    const restoreForcedIfNotSwapped = (): void => {
+      if (wasForced && this.buildEpoch === startEpoch && this.data === startData) {
+        this.needsRefresh = true;
+      }
+    };
+
     const { files, allNames } = await this.walkTextFiles();
+    if (isStaleRun()) {
+      restoreForcedIfNotSwapped();
+      return;
+    }
+
     // Pass 1 (stat only): classify without reading anything.
     const changed: Array<{ relPath: string; size: number; mtimeMs: number; nameOnly: boolean; dataless: boolean }> = [];
     const seen = new Set<string>();
@@ -1595,26 +1825,55 @@ export class LocalSearchIndex implements SearchIndex {
     // file by file (each removal used to scan the whole index).
     const totalFiles = Object.keys(this.data.files).length;
     if (changed.length + deleted.length > Math.max(200, Math.floor(totalFiles * 0.05))) {
-      if ((await this.buildAll()) === 'built') {
+      const buildResult = await this.buildAll();
+      if (buildResult === 'built') {
         return;
       }
-      // The lock was busy or the rebuild failed: fall through to
+      if (isStaleRun()) {
+        restoreForcedIfNotSwapped();
+        return;
+      }
+      // The lock was busy (another process) or the rebuild failed
+      // before swap-in on a still-healthy index: fall through to
       // incremental updates.
     }
     const anyChange = changed.length > 0 || deleted.length > 0;
-    // Pass 2: apply the changes, yielding between files. All
-    // removals share one doomed set; the chunks array is filtered
-    // once at the end, not once per file.
-    const doomedAll = new Set<number>();
+    // Pass 2 (async staging): read and tokenize changed files into
+    // local staged operations without mutating `this.data` across
+    // awaits, so a concurrent `buildAll` or `persist` never sees a
+    // half-updated index or collides on chunk ids.
+    type StagedChange =
+      | { kind: 'remove'; relPath: string }
+      | { kind: 'touch'; relPath: string; mtimeMs: number; size: number }
+      | {
+          kind: 'replace';
+          relPath: string;
+          entry: IndexedFile;
+          chunks: IndexChunk[];
+          postings: Array<{ chunkPos: number; term: string; count: number }>;
+        };
+    const staged: StagedChange[] = [];
     for (const file of changed) {
-      const existing = this.data.files[file.relPath];
+      if (isStaleRun()) {
+        restoreForcedIfNotSwapped();
+        return;
+      }
       if (file.nameOnly) {
-        // Never read: rebuild the filename-only entry.
-        this.removeFileFromIndex(file.relPath, doomedAll);
-        const entry = await this.addFileToIndex(this.data, file, () => this.nextChunkId());
-        if (entry !== null) {
-          this.data.files[file.relPath] = entry;
-        }
+        // Never read: stage a filename-only entry.
+        const { entry, chunks, postings } = this.indexFileContent(
+          file.relPath,
+          '',
+          file.mtimeMs,
+          file.size,
+        );
+        entry.nameOnly = true;
+        staged.push({
+          kind: 'replace',
+          relPath: file.relPath,
+          entry,
+          chunks,
+          postings,
+        });
         await LocalSearchIndex.yieldLoop();
         continue;
       }
@@ -1624,23 +1883,30 @@ export class LocalSearchIndex implements SearchIndex {
       } catch {
         continue;
       }
+      if (isStaleRun()) {
+        restoreForcedIfNotSwapped();
+        return;
+      }
       if (!looksLikeText(data)) {
-        this.removeFileFromIndex(file.relPath, doomedAll);
+        staged.push({ kind: 'remove', relPath: file.relPath });
         await LocalSearchIndex.yieldLoop();
         continue;
       }
       const hash = sha256Hex(data);
+      const existing = this.data.files[file.relPath];
       if (existing !== undefined && existing.hash === hash) {
         // mtime moved (sync tool) but content is identical: refresh
         // the recorded mtime/size without re-indexing.
-        existing.mtimeMs = file.mtimeMs;
-        existing.size = file.size;
-        existing.nameOnly = false;
+        staged.push({
+          kind: 'touch',
+          relPath: file.relPath,
+          mtimeMs: file.mtimeMs,
+          size: file.size,
+        });
         await LocalSearchIndex.yieldLoop();
         continue;
       }
-      this.removeFileFromIndex(file.relPath, doomedAll);
-      const text = data.toString('utf8');
+      const text = decodeUtf8(data);
       const { entry, chunks, postings } = this.indexFileContent(
         file.relPath,
         text,
@@ -1648,9 +1914,55 @@ export class LocalSearchIndex implements SearchIndex {
         file.size,
       );
       entry.hash = hash;
-      this.attachChunks(this.data, entry, chunks, postings, () => this.nextChunkId());
-      this.data.files[file.relPath] = entry;
+      staged.push({
+        kind: 'replace',
+        relPath: file.relPath,
+        entry,
+        chunks,
+        postings,
+      });
       await LocalSearchIndex.yieldLoop();
+    }
+    if (isStaleRun()) {
+      restoreForcedIfNotSwapped();
+      return;
+    }
+
+    // Commit phase (synchronous, no awaits): all removals share one
+    // doomed set; the chunks array is filtered once at the end.
+    const doomedAll = new Set<number>();
+    let mutated = deleted.length > 0;
+    for (const op of staged) {
+      if (this.dirtyDuringRefresh.has(op.relPath)) {
+        // Saved/deleted while this pass was reading it: keep it
+        // dropped so the queued follow-up pass indexes fresh bytes.
+        this.removeFileFromIndex(op.relPath, doomedAll);
+        mutated = true;
+        continue;
+      }
+      if (op.kind === 'remove') {
+        this.removeFileFromIndex(op.relPath, doomedAll);
+        mutated = true;
+      } else if (op.kind === 'touch') {
+        const existing = this.data.files[op.relPath];
+        if (existing !== undefined) {
+          existing.mtimeMs = op.mtimeMs;
+          existing.size = op.size;
+          existing.nameOnly = false;
+          mutated = true;
+        }
+      } else {
+        this.removeFileFromIndex(op.relPath, doomedAll);
+        this.attachChunks(
+          this.data,
+          op.entry,
+          op.chunks,
+          op.postings,
+          () => this.nextChunkId(),
+        );
+        this.data.files[op.relPath] = op.entry;
+        mutated = true;
+      }
     }
     for (const relPath of deleted) {
       this.removeFileFromIndex(relPath, doomedAll);
@@ -1659,7 +1971,7 @@ export class LocalSearchIndex implements SearchIndex {
       this.data.chunks = this.data.chunks.filter((c) => !doomedAll.has(c.id));
     }
     this.data.fileNames = allNames;
-    if (anyChange) {
+    if (anyChange || mutated) {
       this.recomputeTotals();
       // The disk write runs in the background: the in-memory index
       // is already fresh, and a search that triggered this refresh
@@ -1667,7 +1979,11 @@ export class LocalSearchIndex implements SearchIndex {
       // index is a rebuildable cache, so a write lost to a crash or
       // to a lock held by another process self-heals on the next
       // refresh (the changed file's mtime still differs).
-      void this.persist().catch(() => undefined);
+      void this.persist().catch((error: unknown) => {
+        console.error(
+          `[memdrive] search index persist failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
     }
   }
 
@@ -1750,23 +2066,92 @@ export class LocalSearchIndex implements SearchIndex {
     this.data.updatedAt = new Date().toISOString();
   }
 
-  /** Persist the index (single-writer lock, atomic write). Skips the write when another process holds the lock. */
-  public async persist(): Promise<void> {
-    const acquired = await this.acquireLock();
-    if (!acquired) {
-      return;
-    }
-    try {
-      await this.writeIndexFile();
-    } finally {
-      await this.releaseLock();
-    }
+  /** Run `fn` serialized with other in-process operations that acquire `index.lock` and write `index.json`. */
+  private withFileLockQueue<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.fileLockChain.then(fn, fn);
+    this.fileLockChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
   }
 
-  /** Write the current index file; the caller must hold the lock (buildAll holds it for the whole build). */
-  private async writeIndexFile(): Promise<void> {
+  /** Persist the index (single-writer lock, atomic write). Skips the write when another process holds the lock or a build is active. */
+  public persist(): Promise<void> {
+    if (
+      this.buildActive ||
+      this.status !== 'ready' ||
+      this.distrustDisk ||
+      this.inMemoryDamaged
+    ) {
+      return Promise.resolve();
+    }
+    if (this.persistQueued !== null) {
+      return this.persistQueued;
+    }
+    const runOnce = (): Promise<void> => {
+      const p: Promise<void> = this.withFileLockQueue(async () => {
+        if (
+          this.status !== 'ready' ||
+          this.distrustDisk ||
+          this.inMemoryDamaged
+        ) {
+          return;
+        }
+        const acquired = await this.acquireLock();
+        if (!acquired) {
+          return;
+        }
+        try {
+          if (
+            this.status !== 'ready' ||
+            this.distrustDisk ||
+            this.inMemoryDamaged
+          ) {
+            return;
+          }
+          await this.writeIndexFile(this.data);
+        } finally {
+          await this.releaseLock();
+        }
+      }).finally(() => {
+        if (this.persistInFlight === p) {
+          this.persistInFlight = null;
+        }
+      });
+      this.persistInFlight = p;
+      return p;
+    };
+    if (this.persistInFlight !== null) {
+      // Coalesce concurrent persist calls into at most one queued follow-up write.
+      const queued: Promise<void> = this.persistInFlight
+        .catch(() => undefined)
+        .then(() => {
+          if (this.persistQueued === queued) {
+            this.persistQueued = null;
+          }
+          if (
+            this.buildActive ||
+            this.status !== 'ready' ||
+            this.distrustDisk ||
+            this.inMemoryDamaged
+          ) {
+            return undefined;
+          }
+          return runOnce();
+        });
+      this.persistQueued = queued;
+      return queued;
+    }
+    return runOnce();
+  }
+
+  /** Write the given index snapshot; the caller must hold the lock (buildAll holds it for the whole build). */
+  private async writeIndexFile(snapshot: SerializedIndex = this.data): Promise<void> {
+    // Serialize synchronously before any await so async I/O writes an immutable snapshot.
+    const payload = JSON.stringify(snapshot);
     await fs.mkdir(this.cacheDir, { recursive: true });
-    await atomicWrite(this.indexPath, JSON.stringify(this.data), {});
+    await atomicWrite(this.indexPath, payload, {});
   }
 
   /**
@@ -1898,11 +2283,14 @@ export class LocalSearchIndex implements SearchIndex {
    */
   private async releaseLock(): Promise<void> {
     this.stopLockHeartbeat();
-    if (this.lockToken === null) {
-      return;
-    }
     const token = this.lockToken;
     this.lockToken = null;
+    if (this.lockHeartbeatInFlight !== null) {
+      await this.lockHeartbeatInFlight.catch(() => undefined);
+    }
+    if (token === null) {
+      return;
+    }
     try {
       const raw = await fs.readFile(this.lockPath, 'utf8');
       const prev = JSON.parse(raw) as { token?: string };
@@ -1927,18 +2315,23 @@ export class LocalSearchIndex implements SearchIndex {
   private startLockHeartbeat(): void {
     this.stopLockHeartbeat();
     this.lockHeartbeat = setInterval(() => {
-      void (async () => {
-        if (this.lockToken === null) {
-          this.stopLockHeartbeat();
-          return;
-        }
-        const token = this.lockToken;
+      if (this.lockHeartbeatInFlight !== null) {
+        return;
+      }
+      const token = this.lockToken;
+      if (token === null) {
+        this.stopLockHeartbeat();
+        return;
+      }
+      const tick = (async () => {
         try {
           const raw = await fs.readFile(this.lockPath, 'utf8');
           const prev = JSON.parse(raw) as { token?: string; pid?: number };
-          if (prev.token !== token) {
-            // Stolen: stop renewing a lock that is no longer ours.
-            this.stopLockHeartbeat();
+          if (prev.token !== token || this.lockToken !== token) {
+            // Stolen or releasing: stop renewing a lock that is no longer ours.
+            if (this.lockToken === token) {
+              this.stopLockHeartbeat();
+            }
             return;
           }
           const stamp = JSON.stringify({
@@ -1946,15 +2339,41 @@ export class LocalSearchIndex implements SearchIndex {
             time: Date.now(),
             token,
           });
-          // Atomic (temp file + rename): a plain writeFile
-          // truncates first, and a reader in that window sees an
-          // empty / half-written lock and may delete it as "stale".
-          await atomicWrite(this.lockPath, stamp, {});
+          // Re-check before writing, and validate the token again
+          // immediately before rename inside atomicWrite so an
+          // in-flight tick cannot overwrite or resurrect a released
+          // or stolen lock.
+          if (this.lockToken !== token) {
+            return;
+          }
+          await atomicWrite(this.lockPath, stamp, {
+            fs: {
+              rename: async (tmpPath, realPath) => {
+                if (this.lockToken !== token) {
+                  throw new Error('Lock released before heartbeat rename');
+                }
+                const currentRaw = await fs.readFile(realPath, 'utf8');
+                const current = JSON.parse(currentRaw) as { token?: string };
+                if (current.token !== token || this.lockToken !== token) {
+                  throw new Error('Lock token changed before heartbeat rename');
+                }
+                await fs.rename(tmpPath, realPath);
+              },
+            },
+          });
         } catch {
-          // Lock gone or unreadable: stop renewing.
-          this.stopLockHeartbeat();
+          // Lock gone, unreadable, or no longer ours: stop renewing.
+          if (this.lockToken === token) {
+            this.stopLockHeartbeat();
+          }
         }
       })();
+      const tracked: Promise<void> = tick.finally(() => {
+        if (this.lockHeartbeatInFlight === tracked) {
+          this.lockHeartbeatInFlight = null;
+        }
+      });
+      this.lockHeartbeatInFlight = tracked;
     }, 10_000);
     // A heartbeat must never keep the process alive on its own.
     this.lockHeartbeat.unref();
@@ -1976,17 +2395,38 @@ export class LocalSearchIndex implements SearchIndex {
     const dateTo = parseDateBound(query.dateTo, true);
     const modAfter = parseDateBound(query.modifiedAfter, false);
     const modBefore = parseDateBound(query.modifiedBefore, true);
+    const startEpoch = this.buildEpoch;
     try {
       return await this.searchInner(query, dateFrom, dateTo, modAfter, modBefore);
-    } catch {
+    } catch (error) {
+      if (error instanceof MemDriveError) {
+        throw error;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      const indexDamaged = this.inMemoryDamaged || !isValidIndex(this.data);
+      console.error(
+        `[memdrive] search index query failed${indexDamaged ? ' (damaged index, scheduling rebuild)' : ''}: ${message}`,
+      );
+      if (!indexDamaged) {
+        throw error;
+      }
       // A damaged in-memory index must never fail every search
       // forever: mark the on-disk copy distrusted (it is the same
       // damaged data — loading it again would only re-arm the same
       // failure), drop back to unbuilt so callers fall back to a
       // direct scan, and rebuild in the background.
-      this.distrustDisk = true;
-      this.status = 'unbuilt';
-      void this.ensureReady().catch(() => undefined);
+      if (this.buildEpoch === startEpoch) {
+        this.distrustDisk = true;
+        this.inMemoryDamaged = true;
+        if (this.status !== 'building') {
+          this.status = 'unbuilt';
+        }
+        void this.ensureReady().catch((rebuildErr) => {
+          console.error(
+            `[memdrive] background search index recovery failed: ${rebuildErr instanceof Error ? rebuildErr.message : String(rebuildErr)}`,
+          );
+        });
+      }
       return { ready: false, hits: [], total: 0 };
     }
   }
@@ -2007,7 +2447,7 @@ export class LocalSearchIndex implements SearchIndex {
     } else {
       void this.refreshIfNeeded(Date.now(), { background: true }).catch(() => undefined);
     }
-    if (this.status !== 'ready') {
+    if (this.status !== 'ready' || (this.needsRefresh && this.buildActive)) {
       return { ready: false, hits: [], total: 0 };
     }
     // Single-character terms are noise in a multi-character query:
@@ -2045,9 +2485,10 @@ export class LocalSearchIndex implements SearchIndex {
     // Tags are case-insensitive and never keep a leading '#'.
     const tags = (query.tags ?? []).map((t) => t.replace(/^#+/, '').toLowerCase());
     const scopePath = query.path ?? '';
+    const canonScope = scopePath === '' ? '' : canonicalRelPath(scopePath);
 
     const filePasses = (relPath: string, entry: IndexedFile): boolean => {
-      if (scopePath !== '' && relPath !== scopePath && !relPath.startsWith(`${scopePath}/`)) {
+      if (!isUnderCanonicalScope(relPath, canonScope)) {
         return false;
       }
       if (fileTypes.length > 0) {
@@ -2084,22 +2525,75 @@ export class LocalSearchIndex implements SearchIndex {
     for (const chunk of this.data.chunks) {
       chunkById.set(chunk.id, chunk);
     }
-    // One read per file per search: the phrase check and the snippet
-    // builder used to re-read the same file for every chunk.
+    // Bounded LRU cache per search: avoids re-reading a file across its
+    // chunks while capping peak memory on broad phrase/CJK-fallback queries.
+    const MAX_FILE_TEXT_CACHE_ENTRIES = 64;
+    const MAX_FILE_TEXT_CACHE_CHARS = 8_000_000;
     const fileTextCache = new Map<string, string>();
+    let fileTextCacheChars = 0;
     const readFileText = async (relPath: string): Promise<string> => {
       const cached = fileTextCache.get(relPath);
       if (cached !== undefined) {
+        fileTextCache.delete(relPath);
+        fileTextCache.set(relPath, cached);
         return cached;
       }
       let text = '';
       try {
-        text = (await this.backend.readFile(relPath)).toString('utf8');
+        text = decodeUtf8(await this.backend.readFile(relPath));
       } catch {
         text = '';
       }
-      fileTextCache.set(relPath, text);
+      if (text.length <= MAX_FILE_TEXT_CACHE_CHARS) {
+        while (
+          fileTextCache.size >= MAX_FILE_TEXT_CACHE_ENTRIES ||
+          (fileTextCache.size > 0 && fileTextCacheChars + text.length > MAX_FILE_TEXT_CACHE_CHARS)
+        ) {
+          const oldestKey = fileTextCache.keys().next().value;
+          if (oldestKey === undefined) {
+            break;
+          }
+          const oldestVal = fileTextCache.get(oldestKey);
+          fileTextCache.delete(oldestKey);
+          if (oldestVal !== undefined) {
+            fileTextCacheChars -= oldestVal.length;
+          }
+        }
+        fileTextCache.set(relPath, text);
+        fileTextCacheChars += text.length;
+      }
       return text;
+    };
+    const filterChunksByFileText = async (
+      ids: Iterable<number>,
+      needle: string,
+    ): Promise<Set<number>> => {
+      const matched = new Set<number>();
+      const byFile = new Map<string, IndexChunk[]>();
+      for (const id of ids) {
+        const chunk = chunkById.get(id);
+        if (chunk === undefined) {
+          continue;
+        }
+        let list = byFile.get(chunk.file);
+        if (list === undefined) {
+          list = [];
+          byFile.set(chunk.file, list);
+        }
+        list.push(chunk);
+      }
+      for (const [relPath, fileChunks] of byFile) {
+        const fileText = await readFileText(relPath);
+        for (const chunk of fileChunks) {
+          const text = normalizeText(
+            fileText.slice(chunk.startOffset, chunk.endOffset),
+          );
+          if (text.includes(needle)) {
+            matched.add(chunk.id);
+          }
+        }
+      }
+      return matched;
     };
     const totalDocs = this.data.totalChunks;
     const scores = new Map<number, number>();
@@ -2142,7 +2636,7 @@ export class LocalSearchIndex implements SearchIndex {
         if (entry !== undefined) {
           return filePasses(relPath, entry);
         }
-        if (scopePath !== '' && relPath !== scopePath && !relPath.startsWith(`${scopePath}/`)) {
+        if (!isUnderCanonicalScope(relPath, canonScope)) {
           return false;
         }
         if (fileTypes.length > 0) {
@@ -2187,20 +2681,8 @@ export class LocalSearchIndex implements SearchIndex {
     // Filename matches must pass it too; synthetic hits cannot be
     // verified (their content is not indexed) and are dropped.
     if (phrase !== null) {
-      const phraseOk = new Set<number>();
       const candidates = new Set<number>([...scores.keys(), ...nameSubIds]);
-      for (const id of candidates) {
-        const chunk = chunkById.get(id);
-        if (chunk === undefined) {
-          continue;
-        }
-        const text = normalizeText(
-          (await readFileText(chunk.file)).slice(chunk.startOffset, chunk.endOffset),
-        );
-        if (text.includes(phrase)) {
-          phraseOk.add(id);
-        }
-      }
+      const phraseOk = await filterChunksByFileText(candidates, phrase);
       for (const id of [...scores.keys()]) {
         if (!phraseOk.has(id)) {
           scores.delete(id);
@@ -2213,19 +2695,7 @@ export class LocalSearchIndex implements SearchIndex {
     // hits are filtered — filename hits already match the raw
     // keyword, so they are left alone.
     if (substringReq !== null) {
-      const subOk = new Set<number>();
-      for (const id of scores.keys()) {
-        const chunk = chunkById.get(id);
-        if (chunk === undefined) {
-          continue;
-        }
-        const text = normalizeText(
-          (await readFileText(chunk.file)).slice(chunk.startOffset, chunk.endOffset),
-        );
-        if (text.includes(substringReq)) {
-          subOk.add(id);
-        }
-      }
+      const subOk = await filterChunksByFileText(scores.keys(), substringReq);
       for (const id of [...scores.keys()]) {
         if (!subOk.has(id)) {
           scores.delete(id);
@@ -2329,8 +2799,8 @@ export class LocalSearchIndex implements SearchIndex {
     const byHash = new Map<string, Array<{ relPath: string; mtimeMs: number }>>();
     const brokenImageRefs: Array<{ file: string; src: string }> = [];
     const tagCounts = new Map<string, number>();
-    const underScope = (p: string): boolean =>
-      scope === undefined || scope === '' || p === scope || p.startsWith(`${scope}/`);
+    const canonScope = scope !== undefined && scope !== '' ? canonicalRelPath(scope) : '';
+    const underScope = (p: string): boolean => isUnderCanonicalScope(p, canonScope);
     const referenced = new Set<string>();
     let scanIncomplete = false;
     const skippedNotes: Array<{ file: string; reason: string }> = [];
@@ -2365,6 +2835,38 @@ export class LocalSearchIndex implements SearchIndex {
       list.push(file.relPath);
       imageByName.set(key, list);
     }
+    // Canonical relPaths of walked regular (non-symlink) files. A ref
+    // that resolves to anything else — a file symlink, or a path
+    // through a symlinked directory — is also recorded under its real
+    // location, so the file it points at is never reported as an
+    // orphan (archiving it would break the note's image).
+    const plainFiles = new Set<string>();
+    for (const f of allFiles) {
+      if (!f.isSymlink) {
+        plainFiles.add(canonicalRelPath(f.relPath));
+      }
+    }
+    let rootRealForRefs = this.rootRealDir;
+    try {
+      rootRealForRefs = await fs.realpath(this.rootDir);
+    } catch {
+      // Keep the configured root.
+    }
+    const markReferenced = async (relPath: string): Promise<void> => {
+      const key = canonicalRelPath(relPath);
+      referenced.add(key);
+      if (plainFiles.has(key)) {
+        return;
+      }
+      try {
+        const real = await fs.realpath(path.join(this.rootDir, relPath));
+        if (isInside(rootRealForRefs, real)) {
+          referenced.add(canonicalRelPath(toDisplayPath(rootRealForRefs, real)));
+        }
+      } catch {
+        // Broken link: there is no target to protect.
+      }
+    };
     for (const file of files) {
       if (file.size === 0) {
         emptyFiles.push(file.relPath);
@@ -2438,7 +2940,7 @@ export class LocalSearchIndex implements SearchIndex {
       }
       let markdownText: string | null = null;
       if (isMarkdown && data !== null) {
-        markdownText = data.toString('utf8');
+        markdownText = decodeUtf8(data);
         const text = markdownText;
         for (const ref of scanMarkdownImages(text)) {
           let resolved:
@@ -2446,7 +2948,12 @@ export class LocalSearchIndex implements SearchIndex {
             | { status: 'ambiguous'; candidates: string[] }
             | { status: 'broken' };
           try {
-            resolved = await this.resolveImageRef(file.relPath, ref, imageByName);
+            resolved = await this.resolveImageRef(
+              file.relPath,
+              ref,
+              imageByName,
+              rootRealForRefs,
+            );
           } catch {
             // A backend failure (not a bad ref) must not abort the
             // whole scan: mark the note incomplete and stop its
@@ -2455,12 +2962,12 @@ export class LocalSearchIndex implements SearchIndex {
             break;
           }
           if (resolved.status === 'ok') {
-            referenced.add(canonicalRelPath(resolved.path));
+            await markReferenced(resolved.path);
           } else if (resolved.status === 'ambiguous') {
             // Several files share the name: not broken, and none of
             // them is an orphan.
             for (const candidate of resolved.candidates) {
-              referenced.add(canonicalRelPath(candidate));
+              await markReferenced(candidate);
             }
           } else {
             brokenImageRefs.push({ file: file.relPath, src: ref.src });
@@ -2532,16 +3039,21 @@ export class LocalSearchIndex implements SearchIndex {
           continue;
         }
         const data = await this.backend.readFile(file.relPath);
-        const text = data.toString('utf8');
+        const text = decodeUtf8(data);
         const origRelPath = file.relPath.slice('archive/'.length);
         for (const ref of scanMarkdownImages(text)) {
           for (const baseRel of [file.relPath, origRelPath]) {
-            const resolved = await this.resolveImageRef(baseRel, ref, imageByName);
+            const resolved = await this.resolveImageRef(
+              baseRel,
+              ref,
+              imageByName,
+              rootRealForRefs,
+            );
             if (resolved.status === 'ok') {
-              referenced.add(canonicalRelPath(resolved.path));
+              await markReferenced(resolved.path);
             } else if (resolved.status === 'ambiguous') {
               for (const candidate of resolved.candidates) {
-                referenced.add(canonicalRelPath(candidate));
+                await markReferenced(candidate);
               }
             }
           }
@@ -2583,15 +3095,14 @@ export class LocalSearchIndex implements SearchIndex {
     const tags = [...tagCounts.entries()]
       .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
       .map(([tag, count]) => ({ tag, count }));
-    if (scope !== undefined && scope !== '') {
-      const under = (p: string): boolean => p === scope || p.startsWith(`${scope}/`);
+    if (canonScope !== '') {
       return {
-        emptyFiles: emptyFiles.filter(under),
+        emptyFiles: emptyFiles.filter(underScope),
         duplicateGroups: duplicateGroups
-          .map((g) => g.filter(under))
+          .map((g) => g.filter(underScope))
           .filter((g) => g.length > 1),
-        brokenImageRefs: brokenImageRefs.filter((r) => under(r.file)),
-        orphanCandidates: orphanCandidates.filter(under),
+        brokenImageRefs: brokenImageRefs.filter((r) => underScope(r.file)),
+        orphanCandidates: orphanCandidates.filter(underScope),
         tags,
         scanIncomplete,
         skippedNotes,
@@ -2608,8 +3119,30 @@ export class LocalSearchIndex implements SearchIndex {
     };
   }
 
-  /** True only when the path exists and is a regular file (not a directory). */
-  private async isRegularFile(relPath: string): Promise<boolean> {
+  /**
+   * True only when the path stays inside the real library root, exists,
+   * and is a regular file (not a directory). Validates symlink containment
+   * before calling `backend.stat` so outside targets are never probed.
+   */
+  private async isRegularFile(
+    relPath: string,
+    rootRealDir = this.rootRealDir,
+  ): Promise<boolean> {
+    if (relPath === '' || relPath === '.') {
+      return false;
+    }
+    const abs = path.resolve(this.rootDir, ...relPath.split('/'));
+    if (!isInside(this.rootDir, abs)) {
+      return false;
+    }
+    try {
+      await assertInsideRealRoot(rootRealDir, abs);
+    } catch (error) {
+      if (error instanceof SandboxError) {
+        return false;
+      }
+      throw error;
+    }
     const st = await this.backend.stat(relPath);
     return st !== null && !st.isDirectory;
   }
@@ -2630,6 +3163,7 @@ export class LocalSearchIndex implements SearchIndex {
     noteRelPath: string,
     ref: MarkdownImageRef,
     imageByName: Map<string, string[]>,
+    rootRealDir = this.rootRealDir,
   ): Promise<
     | { status: 'ok'; path: string }
     | { status: 'ambiguous'; candidates: string[] }
@@ -2681,7 +3215,7 @@ export class LocalSearchIndex implements SearchIndex {
       // notes/deep/ means notes/pic.png), so fall through to the
       // note-relative branch instead of returning 'broken' here.
       const vaultEscapes = vaultPath === '..' || vaultPath.startsWith('../');
-      if (!vaultEscapes && (await this.isRegularFile(vaultPath))) {
+      if (!vaultEscapes && (await this.isRegularFile(vaultPath, rootRealDir))) {
         return { status: 'ok', path: vaultPath };
       }
       // Then note-relative.
@@ -2691,7 +3225,7 @@ export class LocalSearchIndex implements SearchIndex {
       if (noteRelative === '..' || noteRelative.startsWith('../')) {
         return { status: 'broken' };
       }
-      if (await this.isRegularFile(noteRelative)) {
+      if (await this.isRegularFile(noteRelative, rootRealDir)) {
         return { status: 'ok', path: noteRelative };
       }
       // Then path-suffix: the vault path ending in the given path.
@@ -2727,7 +3261,7 @@ export class LocalSearchIndex implements SearchIndex {
     if (resolved === '..' || resolved.startsWith('../')) {
       return { status: 'broken' };
     }
-    if (await this.isRegularFile(resolved)) {
+    if (await this.isRegularFile(resolved, rootRealDir)) {
       return { status: 'ok', path: resolved };
     }
     // Fallback for non-Obsidian refs carrying a query suffix
@@ -2746,7 +3280,7 @@ export class LocalSearchIndex implements SearchIndex {
               path.posix.join(path.posix.dirname(noteRelPath), strippedSrc),
             );
         if (fallbackResolved !== '..' && !fallbackResolved.startsWith('../')) {
-          if (await this.isRegularFile(fallbackResolved)) {
+          if (await this.isRegularFile(fallbackResolved, rootRealDir)) {
             return { status: 'ok', path: fallbackResolved };
           }
         }
@@ -2873,8 +3407,8 @@ export class LocalSearchIndex implements SearchIndex {
   }
 
   /** Walk every file (any type) for orphan detection. Same symlink guards as the text walk: no escapes, no loops. */
-  private async walkAllFiles(onSkip?: (file: string, reason: string) => void): Promise<Array<{ relPath: string; mtimeMs: number }>> {
-    const out: Array<{ relPath: string; mtimeMs: number }> = [];
+  private async walkAllFiles(onSkip?: (file: string, reason: string) => void): Promise<Array<{ relPath: string; mtimeMs: number; isSymlink: boolean }>> {
+    const out: Array<{ relPath: string; mtimeMs: number; isSymlink: boolean }> = [];
     let rootRealDir = this.rootRealDir;
     try {
       rootRealDir = await fs.realpath(this.rootDir);
@@ -2882,10 +3416,24 @@ export class LocalSearchIndex implements SearchIndex {
       // Keep the configured root.
     }
     const visited = new Set<string>([rootRealDir]);
-    const queue: string[] = [''];
-    const pendingSymlinkDirs: Array<{ relPath: string; real: string }> = [];
-    while (queue.length > 0) {
-      const current = queue.shift() as string;
+    const realQueue: string[] = [''];
+    const symlinkQueue: Array<{ relPath: string; real: string }> = [];
+    const archiveSymlinkQueue: Array<{ relPath: string; real: string }> = [];
+    while (realQueue.length > 0 || symlinkQueue.length > 0 || archiveSymlinkQueue.length > 0) {
+      let current: string;
+      if (realQueue.length > 0) {
+        current = realQueue.shift() as string;
+      } else {
+        const next =
+          symlinkQueue.length > 0
+            ? (symlinkQueue.shift() as { relPath: string; real: string })
+            : (archiveSymlinkQueue.shift() as { relPath: string; real: string });
+        if (visited.has(next.real)) {
+          continue;
+        }
+        visited.add(next.real);
+        current = next.relPath;
+      }
       let entries;
       try {
         entries = await this.backend.listDirectory(current);
@@ -2930,28 +3478,28 @@ export class LocalSearchIndex implements SearchIndex {
             }
           }
           if (entry.isSymlink) {
-            // Defer symlink directories: a real directory to the same
-            // target, listed in the same parent, must win the visited
-            // race so walked files carry the real relPath.
-            pendingSymlinkDirs.push({ relPath: entry.relPath, real });
+            // Defer ALL symlink directories until every real (non-symlink)
+            // directory across the library has been walked, and defer
+            // archive/ symlink directories behind active ones so a symlink
+            // inside archive/ can never shadow an active directory.
+            const lowerRel = entry.relPath.toLowerCase();
+            if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
+              archiveSymlinkQueue.push({ relPath: entry.relPath, real });
+            } else {
+              symlinkQueue.push({ relPath: entry.relPath, real });
+            }
           } else if (!visited.has(real)) {
             visited.add(real);
-            queue.push(entry.relPath);
+            realQueue.push(entry.relPath);
           }
           continue;
         }
         out.push({
           relPath: entry.relPath,
           mtimeMs: new Date(entry.modifiedAt).getTime(),
+          isSymlink: entry.isSymlink,
         });
       }
-      for (const pending of pendingSymlinkDirs) {
-        if (!visited.has(pending.real)) {
-          visited.add(pending.real);
-          queue.push(pending.relPath);
-        }
-      }
-      pendingSymlinkDirs.length = 0;
       await LocalSearchIndex.yieldLoop();
     }
     return out;

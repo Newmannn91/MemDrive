@@ -269,12 +269,17 @@ export async function sandboxPath(
   // when it exists (a file can legitimately contain `%` in its name).
   const decoded = decodeUserPath(input);
   if (decoded !== input) {
+    const literalAbs = resolveInRoot(rootDir, input);
+    await assertInsideRealRoot(rootRealDir, literalAbs);
     try {
-      const literalAbs = resolveInRoot(rootDir, input);
       await fs.stat(literalAbs);
-      return assertInsideRealRoot(rootRealDir, literalAbs);
-    } catch {
-      // Literal path does not exist (or escapes): fall through to decoded.
+      return literalAbs;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        throw error;
+      }
+      // Literal path does not exist: fall through to decoded.
     }
   }
   const absolute = resolveInRoot(rootDir, decoded);

@@ -136,6 +136,9 @@ export function isPublicIpv6(ip: string): boolean {
     const ipv4 = `${w6 >> 8}.${w6 & 0xff}.${w7 >> 8}.${w7 & 0xff}`;
     return isPublicIpv4(ipv4);
   }
+  if (w0 === 0 && w1 === 0 && w2 === 0 && w3 === 0 && w4 === 0xffff && w5 === 0) {
+    return false; // ::ffff:0:0:0/96: IPv4-translated (RFC 2765)
+  }
   if (w0 === 0x0064 && w1 === 0xff9b) return false; // 64:ff9b::/96: NAT64 well-known prefix
   if (w0 === 0x0100 && w1 === 0 && w2 === 0 && w3 === 0) return false; // 100::/64: discard prefix
   if (w0 === 0x2001 && (w1 === 0x0db8 || w1 === 0x0000)) return false; // 2001:db8::/32 (doc) & 2001::/32 (Teredo)
