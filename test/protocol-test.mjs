@@ -4850,12 +4850,18 @@ async function main() {
       const libDir = path.join(scratch, 'index-cold-lib');
       await fs.mkdir(path.join(libDir, 'attachments'), { recursive: true });
       await fs.writeFile(path.join(libDir, 'attachments', 'pic.png'), smallPng);
+      // The index's rootRealDir must be canonical: on macOS the temp
+      // dir sits under symlinked /var/folders, and the 0.9.1
+      // assertInsideRealRoot check realpaths the file, so a raw
+      // /var/... root makes every vault-root ref report 'broken'
+      // (CI #18 class). Production always passes a realpath'd root.
+      const libRealDir = await fs.realpath(libDir);
       // A real file OUTSIDE the library, one level up: an escaping
       // ref must not be able to probe it.
       await fs.writeFile(path.join(scratch, 'outside.png'), smallPng);
       const cacheDir = path.join(scratch, 'index-cold-cache');
       process.env['MEMDRIVE_CACHE_DIR'] = cacheDir;
-      const idx = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      const idx = new LocalSearchIndex(libDir, libRealDir, new LocalStorageBackend(libDir));
       // Cold, index not ready: a basename-only ref needs the
       // filename map, so it reports 'broken' instead of blocking
       // on the whole build (Sonnet: a cold read must not wait for
@@ -4877,7 +4883,7 @@ async function main() {
       // used on the first read after a (simulated) restart — a
       // fresh instance over the same cache dir loads it fast
       // instead of reporting the basename ref broken.
-      const idx2 = new LocalSearchIndex(libDir, libDir, new LocalStorageBackend(libDir));
+      const idx2 = new LocalSearchIndex(libDir, libRealDir, new LocalStorageBackend(libDir));
       const restarted = await idx2.resolveNoteImageRef('notes.md', { kind: 'obsidian', src: 'pic.png' });
       assert.equal(restarted.status, 'ok', 'a persisted index must be loaded on the first read after restart');
       assert.equal(restarted.path, 'attachments/pic.png');

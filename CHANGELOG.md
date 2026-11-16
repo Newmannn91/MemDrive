@@ -8,6 +8,14 @@ earlier versions were delivered as zips and verified by the
 protocol suite (see TEST-REPORT.md). Each section below maps
 to a GitHub Release.
 
+## [0.9.2] - 2026-11-16
+
+Test-only fix for the macOS CI failure on 0.9.1. The cold-index test now passes a realpath'd library root, so vault-root Obsidian image refs resolve on a cold index. The 0.9.1 sandbox check in `isRegularFile` realpaths the file before comparing it against the root; on macOS the temp dir sits under symlinked `/var/folders`, so a raw root made the check report 'broken'. No source changes. Tests 215/215 green on Linux.
+
+### Fixed
+
+- **macOS CI: cold-index test passes a realpath'd library root.** Same pattern as the CI #18 fix — the test's two `LocalSearchIndex` constructions now use `await fs.realpath(libDir)` for the `rootRealDir` argument. Production always passes a realpath'd root, so no source change was needed.
+
 ## [0.9.1] - 2026-11-16
 
 Bug-fix release. A full-package review of the 0.9.0 code (Hydrogen, agy) found 30 issues — 6 high, 16 medium, 8 low; 22 confirmed, 8 partially confirmed, 0 false positives. All 30 are fixed here, verified against the code with the build passing and 215/215 tests green (including 6 new regression tests).
