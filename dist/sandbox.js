@@ -159,7 +159,7 @@ export function resolveInRoot(rootDir, input) {
  * yet: walk up to the nearest existing ancestor, realpath it, then re-join
  * the remaining segments.
  */
-async function realLocation(absolutePath, depth = 0) {
+export async function realLocation(absolutePath, depth = 0) {
     if (depth > 32) {
         throw new SandboxError(`Too many levels of symbolic links: ${absolutePath}`);
     }
@@ -204,7 +204,11 @@ async function realLocation(absolutePath, depth = 0) {
                     if (linkError instanceof SandboxError) {
                         throw linkError;
                     }
-                    // Not an existing symlink; continue walking up to parent.
+                    const linkCode = linkError.code;
+                    if (linkCode !== 'ENOENT' && linkCode !== 'EINVAL') {
+                        throw linkError;
+                    }
+                    // Not an existing symlink (or concurrently replaced); continue walking up to parent.
                 }
             }
             const parent = path.dirname(current);
@@ -267,8 +271,9 @@ export async function sandboxPathForWrite(rootDir, rootRealDir, input) {
     const absolute = resolveInRoot(rootDir, input);
     // Cross-platform check on the root-relative part only (the root
     // itself is the user's own directory and may legitimately contain
-    // any name).
-    validateCrossPlatformSegments(path.relative(rootDir, absolute));
+    // any name). Use toDisplayPath so case/NFC differences between
+    // rootDir and absolute on macOS/Windows do not yield `../../...`.
+    validateCrossPlatformSegments(toDisplayPath(rootDir, absolute));
     return assertInsideRealRoot(rootRealDir, absolute);
 }
 /** Root-relative POSIX-style path (forward slashes) for display and storage. */

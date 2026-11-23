@@ -206,7 +206,11 @@ async function makeScreenshotPng() {
 }
 
 async function main() {
-  const scratch = await fs.mkdtemp(path.join(os.tmpdir(), 'memdrive-test-'));
+  // 0.9.3: realpath the scratch dir once up front. On macOS the temp
+  // dir lives under /var/folders, a symlink to /private/var/folders,
+  // so every libDir derived from an unresolved scratch fails the
+  // sandbox's realpath check (0.9.1 / 0.9.2 macOS CI failures).
+  const scratch = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'memdrive-test-')));
   const root = path.join(scratch, 'library');
   await fs.mkdir(root, { recursive: true });
   const outside = path.join(scratch, 'outside');
@@ -1652,19 +1656,19 @@ async function main() {
       assert.equal(pipe.ok, false);
     });
 
-    await check('probeCandidateRoots (Linux fake): existing OneDrive + always-listed default', async () => {
+    await check('0.9.3 MD-01: probeCandidateRoots (Linux fake): default listed first, OneDrive offers a MemDrive subfolder', async () => {
       const found = await probeCandidateRoots({
         platform: 'linux',
         homeDir: '/home/testuser',
         exists: async (p) => p === '/home/testuser/OneDrive',
       });
       assert.deepEqual(found, [
-        { path: '/home/testuser/OneDrive', label: 'OneDrive' },
         { path: '/home/testuser/memdrive', label: 'Default (~/memdrive)' },
+        { path: '/home/testuser/OneDrive/MemDrive', label: 'OneDrive (MemDrive folder)' },
       ]);
     });
 
-    await check('probeCandidateRoots (Windows fake): DriveFS + label probe + fallback dedupe, no hardcoded G:', async () => {
+    await check('0.9.3 MD-01: probeCandidateRoots (Windows fake): DriveFS + label probe + fallback dedupe, no hardcoded G:, default first', async () => {
       const win = path.win32;
       const home = 'C:\\Users\\x';
       const existing = new Set([
@@ -1684,10 +1688,13 @@ async function main() {
         driveLetterProbe: async () => 'G',
       });
       const paths = found.map((c) => c.path);
-      assert.ok(paths.includes('G:\\My Drive'), `expected G:\\My Drive in ${paths.join(', ')}`);
-      assert.equal(paths.filter((p) => p === 'G:\\My Drive').length, 1, 'probe + fallback must dedupe to one entry');
+      assert.ok(paths.includes('G:\\My Drive\\MemDrive'), `expected G:\\My Drive\\MemDrive in ${paths.join(', ')}`);
+      assert.equal(paths.filter((p) => p === 'G:\\My Drive\\MemDrive').length, 1, 'probe + fallback must dedupe to one entry');
+      assert.ok(!paths.includes('G:\\My Drive'), 'the cloud root itself must never be offered');
+      assert.ok(paths.includes(win.join(home, 'OneDrive', 'MemDrive')), 'OneDrive offers a MemDrive subfolder');
+      assert.ok(!paths.includes(win.join(home, 'OneDrive')), 'the OneDrive root itself must never be offered');
       assert.ok(!paths.some((p) => p.startsWith('H:')), 'H: must not appear when it does not exist');
-      assert.equal(paths[paths.length - 1], win.join(home, 'memdrive'));
+      assert.equal(paths[0], win.join(home, 'memdrive'), 'default must be first (Enter = 1)');
     });
 
     await check('probeCandidateRoots (Windows fake): no DriveFS means the label probe never runs', async () => {
@@ -1711,7 +1718,7 @@ async function main() {
       ]);
     });
 
-    await check('probeCandidateRoots (macOS fake): Google Drive volume + iCloud candidates', async () => {
+    await check('0.9.3 MD-01: probeCandidateRoots (macOS fake): Google Drive volume + iCloud MemDrive subfolders, default first', async () => {
       const existing = new Set([
         '/Volumes/GoogleDrive',
         '/Users/you/Library/Mobile Documents/com~apple~CloudDocs',
@@ -1722,9 +1729,13 @@ async function main() {
         exists: async (p) => existing.has(p),
       });
       const labels = found.map((c) => c.label);
-      assert.ok(labels.includes('Google Drive'));
-      assert.ok(labels.includes('iCloud Drive'));
-      assert.equal(found[found.length - 1].path, '/Users/you/memdrive');
+      const paths = found.map((c) => c.path);
+      assert.ok(labels.includes('Google Drive (MemDrive folder)'));
+      assert.ok(labels.includes('iCloud Drive (MemDrive folder)'));
+      assert.ok(paths.includes('/Volumes/GoogleDrive/MemDrive'));
+      assert.ok(paths.includes('/Users/you/Library/Mobile Documents/com~apple~CloudDocs/MemDrive'));
+      assert.ok(!paths.includes('/Volumes/GoogleDrive'), 'the cloud root itself must never be offered');
+      assert.equal(found[0].path, '/Users/you/memdrive', 'default must be first (Enter = 1)');
     });
 
     await check('expandCustomPath: ~ expansion, absolute-only, quote stripping', async () => {
@@ -4427,7 +4438,7 @@ async function main() {
       assert.equal(await fs.readFile(path.join(libDir, 'archive', 'src.txt'), 'utf8'), 'only copy');
     });
 
-    await check('0.9.0 fix: moveFile keeps the new source when the source is replaced before unlink', async () => {
+    await check('0.9.3 fix: moveFile reports SOURCE_CHANGED and keeps the new source when the source is replaced before unlink', async () => {
       const rawLibDir = path.join(scratch, 'fix-move-replaced-lib');
       await fs.mkdir(rawLibDir, { recursive: true });
       const libDir = await fs.realpath(rawLibDir);
@@ -4456,13 +4467,15 @@ async function main() {
           await replaceSource();
         }
       };
+      // 0.9.3 (S1): a replaced source must surface SOURCE_CHANGED, keep the
+      // new source in place, and remove the stale archive copy (no silent success).
       try {
-        await backend.moveFile('src.txt', 'archive/src.txt');
+        await assert.rejects(backend.moveFile('src.txt', 'archive/src.txt'), (e) => e.code === 'SOURCE_CHANGED');
       } finally {
         fs.link = origLink;
         fs.copyFile = origCopyFile;
       }
-      assert.equal(await fs.readFile(path.join(libDir, 'archive', 'src.txt'), 'utf8'), 'original content');
+      await assert.rejects(fs.lstat(path.join(libDir, 'archive', 'src.txt')), { code: 'ENOENT' });
       assert.equal(await fs.readFile(srcAbs, 'utf8'), 'new content');
 
       // Also verify symlinks are checked by lstat (link identity), not target identity.
@@ -4481,13 +4494,13 @@ async function main() {
           }
         };
         try {
-          await backend.moveFile('sym.txt', 'archive/sym.txt');
+          await assert.rejects(backend.moveFile('sym.txt', 'archive/sym.txt'), (e) => e.code === 'SOURCE_CHANGED');
         } finally {
           fs.symlink = origSymlink;
         }
-        assert.equal((await fs.lstat(destSymAbs)).isSymbolicLink(), true);
-        assert.equal(await fs.readFile(destSymAbs, 'utf8'), 'target content');
+        await assert.rejects(fs.lstat(destSymAbs), { code: 'ENOENT' });
         assert.equal(await fs.readFile(symAbs, 'utf8'), 'replaced symlink');
+        assert.equal(await fs.readFile(targetAbs, 'utf8'), 'target content');
       }
     });
 

@@ -8,6 +8,23 @@ earlier versions were delivered as zips and verified by the
 protocol suite (see TEST-REPORT.md). Each section below maps
 to a GitHub Release.
 
+## [0.9.3] - 2026-11-23
+
+Bug-fix release. Opus 终审两轮（27 条发现，10 条修在这里，其余进 backlog）和之后三轮 Neon 整包审（15 条新发现，全部修在这里）。构建通过，测试 215/215。
+
+### Fixed
+
+- **Setup wizard default library.** 向导现在先给 `~/memdrive`，再列各云盘的 `MemDrive` 子文件夹（OneDrive、Google Drive、iCloud），不再默认云盘根目录。
+- **Local image paths.** `copyLocalImage` 现在会拦经符号链接或 UNC 工作目录绕进来的 UNC/设备路径，不只拦字面 UNC 路径。
+- **Image preview cap.** 预览上限 25,000,000 像素，超了只给文字说明。
+- **edit_tags quote handling.** 修了 6 处相关问题：flow 列表里 tag 中间的 `?` 不再弄坏 PyYAML；`readTag` 不再静默剥末尾引号，`users'`、`5"` 不再被改写或误删；flow 列表词中撇号（`[Bob's, Alice's]`）不再把两个标签合并；plain 写法引号残缺现在直接拒绝，不再静默改写。
+- **edit_tags scope.** `edit_tags` 只改 Markdown 笔记，不再接受 `.txt`。
+- **Archive/restore and symlinks.** 已归档的库内文件符号链接现在能恢复回来；归档符号链接保持原样；`moveFile` 源和目标是同一文件时不再静默返回。
+- **Restore path handling.** 恢复不再二次清洗目标路径：字面叫 `~/foo.md`、`'note'`、` note.md` 的文件按原名恢复，不再失败或悄悄改名。
+- **Cleanup plans.** 批量清理里单个条目抛错只跳过那一条，不中止整批、不跳过索引更新和计划归档；归档/恢复/apply 现在都按真实路径（解析符号链接后）校验 `archive/` 边界。
+- **Other fixes.** 资源目录按需创建；`writeFile` 失败不再留半成品；版本号统一；flow 列表 `''` 转义补全；macOS 大小写/Unicode 误拒和列表预算截断修好；沙箱真实路径检查不再 fail-open。
+- **Tests.** 测试建临时目录后立刻 realpath，从根上修了 macOS `/var` 符号链接导致 CI 失败的老问题。测试 215/215。
+
 ## [0.9.2] - 2026-11-16
 
 Test-only fix for the macOS CI failure on 0.9.1. The cold-index test now passes a realpath'd library root, so vault-root Obsidian image refs resolve on a cold index. The 0.9.1 sandbox check in `isRegularFile` realpaths the file before comparing it against the root; on macOS the temp dir sits under symlinked `/var/folders`, so a raw root made the check report 'broken'. No source changes. Tests 215/215 green on Linux.

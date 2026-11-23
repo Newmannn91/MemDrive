@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import { homedir } from 'node:os';
 import path from 'node:path';
 /** Server version (single source of truth; index.ts and net-guard.ts import it). */
-export const VERSION = '0.9.2';
+export const VERSION = '0.9.3';
 /** Maximum text payload returned by read_file. Larger files are truncated. */
 export const TEXT_MAX_BYTES = 1_000_000;
 /**
@@ -83,6 +83,12 @@ export function resolveResponseBudgetBytes(rawValue) {
  * 20 MB OpenAI). Do not raise this without re-checking those docs.
  */
 export const IMAGE_PREVIEW_MAX_BYTES = 3_500_000;
+/**
+ * Maximum pixel count (width × height) decoded for an image preview.
+ * Images exceeding this are skipped with a note before pixel decoding
+ * so tall or huge images cannot spike memory or block the server.
+ */
+export const IMAGE_PREVIEW_MAX_PIXELS = 25_000_000;
 /** MIME type used for downscaled image previews (universally accepted). */
 export const IMAGE_PREVIEW_MIME = 'image/jpeg';
 /** JPEG quality used when generating an in-memory preview. */

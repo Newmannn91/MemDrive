@@ -115,28 +115,7 @@ export class LocalStorageBackend {
         if (mode === 'new') {
             try {
                 const handle = await fs.open(target, 'wx');
-                try {
-                    await handle.writeFile(data);
-                    try {
-                        await handle.sync();
-                    }
-                    catch (error) {
-                        // Filesystems without fsync support (some FUSE / network
-                        // mounts) throw EINVAL / ENOTSUP / EOPNOTSUPP from sync()
-                        // after the data is already written; failing the call here
-                        // would leave the file on disk and turn a retry into
-                        // ALREADY_EXISTS. The write + close path already pushed
-                        // the data through, which is sufficient durability for a
-                        // local note store. Any other error still throws.
-                        const code = error.code;
-                        if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP') {
-                            throw error;
-                        }
-                    }
-                }
-                finally {
-                    await handle.close();
-                }
+                await writeAndCloseHandle(handle, data, { path: target });
                 return { created: true };
             }
             catch (error) {
@@ -152,6 +131,7 @@ export class LocalStorageBackend {
             // `created` is race-free.
             let handle;
             let created = false;
+            const cleanupTarget = { path: null };
             for (let attempt = 0; attempt < 16; attempt++) {
                 let preStat = null;
                 try {
@@ -169,6 +149,7 @@ export class LocalStorageBackend {
                     try {
                         handle = await fs.open(target, fs.constants.O_WRONLY | fs.constants.O_APPEND);
                         created = false;
+                        cleanupTarget.path = null;
                         break;
                     }
                     catch (error) {
@@ -181,6 +162,7 @@ export class LocalStorageBackend {
                 try {
                     handle = await fs.open(target, 'wx');
                     created = true;
+                    cleanupTarget.path = target;
                     break;
                 }
                 catch (error) {
@@ -192,6 +174,7 @@ export class LocalStorageBackend {
                             if (lst.isSymbolicLink()) {
                                 handle = await fs.open(target, 'a');
                                 created = true;
+                                cleanupTarget.path = null;
                                 break;
                             }
                         }
@@ -210,32 +193,16 @@ export class LocalStorageBackend {
             if (handle === undefined) {
                 throw new Error(`Could not open ${relPath} for append`);
             }
-            try {
-                const st = await handle.stat();
+            const appendHandle = handle;
+            await writeAndCloseHandle(appendHandle, data, cleanupTarget, async () => {
+                const st = await appendHandle.stat();
                 if (!(st.mode & 0o200)) {
                     throw new MemDriveError('READ_ONLY', `File is read-only: ${relPath}`);
                 }
-                await handle.writeFile(data);
-                try {
-                    await handle.sync();
+                if (created && cleanupTarget.path === null && st.size === 0) {
+                    cleanupTarget.path = await fs.realpath(target).catch(() => null);
                 }
-                catch (error) {
-                    // Filesystems without fsync support (some FUSE / network
-                    // mounts) throw EINVAL / ENOTSUP / EOPNOTSUPP from sync()
-                    // after the data is already written; failing the call here
-                    // would leave the file on disk and turn a retry into
-                    // ALREADY_EXISTS. The write + close path already pushed
-                    // the data through, which is sufficient durability for a
-                    // local note store. Any other error still throws.
-                    const code = error.code;
-                    if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP') {
-                        throw error;
-                    }
-                }
-            }
-            finally {
-                await handle.close();
-            }
+            });
             return { created };
         }
         // Atomic replace via the shared helper (resolves symlinks with
@@ -320,6 +287,19 @@ export class LocalStorageBackend {
                     }
                 }
             }
+            const abortSourceChanged = async (reason) => {
+                const message = `${srcRel} changed during the move and was left in place (${reason}).`;
+                try {
+                    await fs.unlink(destAbs);
+                }
+                catch (cleanupError) {
+                    if (cleanupError.code !== 'ENOENT') {
+                        const cleanupMessage = cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+                        throw new MemDriveError('SOURCE_CHANGED', `${message} Also failed to remove destination ${destRel}: ${cleanupMessage}`);
+                    }
+                }
+                throw new MemDriveError('SOURCE_CHANGED', message);
+            };
             try {
                 // Verify srcAbs is still the same entry we started moving before
                 // unlinking it: if a sync client or another process replaced it
@@ -333,7 +313,7 @@ export class LocalStorageBackend {
                     currentLst.size === lst.size &&
                     currentLst.mtimeMs === lst.mtimeMs;
                 if (!sameEntry) {
-                    return;
+                    return await abortSourceChanged('file metadata changed');
                 }
                 if (linkTarget !== undefined) {
                     let currentLinkTarget;
@@ -343,17 +323,20 @@ export class LocalStorageBackend {
                     catch (readlinkErr) {
                         if (readlinkErr.code === 'EINVAL') {
                             // Replaced by a non-symlink between lstat and readlink.
-                            return;
+                            return await abortSourceChanged('symlink was replaced');
                         }
                         throw readlinkErr;
                     }
                     if (currentLinkTarget !== linkTarget) {
-                        return;
+                        return await abortSourceChanged('symlink target changed');
                     }
                 }
                 await fs.unlink(srcAbs);
             }
             catch (e) {
+                if (e instanceof MemDriveError && e.code === 'SOURCE_CHANGED') {
+                    throw e;
+                }
                 if (e.code === 'ENOENT') {
                     // The source vanished after the target was created (a sync
                     // client or another process moved it). The target is now
@@ -542,6 +525,45 @@ export class LocalStorageBackend {
             }
         }
         return hits;
+    }
+}
+/**
+ * Call `handle.sync()`, ignoring filesystem-unsupported errors.
+ * Some FUSE / network mounts throw EINVAL / ENOTSUP / EOPNOTSUPP after
+ * the data is already written; the write + close path is sufficient
+ * durability for a local note store. Any other error propagates.
+ */
+async function syncIgnoreUnsupported(handle) {
+    try {
+        await handle.sync();
+    }
+    catch (error) {
+        const code = error.code;
+        if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EOPNOTSUPP') {
+            throw error;
+        }
+    }
+}
+/**
+ * Write `data`, fsync, and close an open file handle. On any failure,
+ * close the handle first (so unlink does not fail on Windows due to an
+ * open handle), remove any newly created target file, and re-throw.
+ */
+async function writeAndCloseHandle(handle, data, cleanupTarget, beforeWrite) {
+    try {
+        if (beforeWrite !== undefined) {
+            await beforeWrite();
+        }
+        await handle.writeFile(data);
+        await syncIgnoreUnsupported(handle);
+        await handle.close();
+    }
+    catch (error) {
+        await handle.close().catch(() => undefined);
+        if (cleanupTarget.path !== null) {
+            await fs.unlink(cleanupTarget.path).catch(() => undefined);
+        }
+        throw error;
     }
 }
 /** Heuristic: no NUL byte in the first 8 KB means probably text. */

@@ -90,13 +90,16 @@ export async function probeGoogleDriveLetter() {
     }
 }
 /**
- * Probe candidate library roots for the current OS. Only roots that
- * exist are returned, except the `~/memdrive` default, which is
- * always listed (the wizard creates it). Order: OneDrive, Google
- * Drive, iCloud, default. Google Drive on Windows uses the 3-step
- * chain from the spec: DriveFS presence → PowerShell label probe →
- * existence-checked common paths. No drive letter is ever hardcoded
- * as the answer: `G:`/`H:` paths are candidates only when they exist.
+ * Probe candidate library roots for the current OS. The `~/memdrive`
+ * default is always listed first (the wizard creates it, and pressing
+ * Enter picks it); cloud sync candidates follow in order: OneDrive,
+ * Google Drive, iCloud, each pointing at a `MemDrive` subfolder
+ * inside the detected cloud root (only listed when the cloud root
+ * exists; the `MemDrive` subfolder is created on selection). Google
+ * Drive on Windows uses the 3-step chain from the spec: DriveFS
+ * presence → PowerShell label probe → existence-checked common paths.
+ * No drive letter is ever hardcoded as the answer: `G:`/`H:` paths
+ * are candidates only when they exist.
  */
 export async function probeCandidateRoots(deps = {}) {
     const platform = deps.platform ?? process.platform;
@@ -104,16 +107,26 @@ export async function probeCandidateRoots(deps = {}) {
     const home = deps.homeDir ?? homedir();
     const pathMod = pathModuleFor(platform);
     const exists = (p) => defaultExists(deps, p);
-    const found = [];
-    const maybeAdd = async (candidatePath, label) => {
-        if (await exists(candidatePath)) {
-            found.push({ path: candidatePath, label });
+    const found = [
+        // The default is always listed first (Enter = 1); the wizard
+        // creates it if missing. Must match config.ts (`~/memdrive`).
+        {
+            path: pathMod.join(home, 'memdrive'),
+            label: 'Default (~/memdrive)',
+        },
+    ];
+    const maybeAddCloud = async (cloudRoot, label) => {
+        if (await exists(cloudRoot)) {
+            found.push({
+                path: pathMod.join(cloudRoot, 'MemDrive'),
+                label,
+            });
         }
     };
     if (platform === 'win32') {
         const oneDrive = env['OneDrive'];
         if (oneDrive) {
-            await maybeAdd(oneDrive, 'OneDrive');
+            await maybeAddCloud(oneDrive, 'OneDrive (MemDrive folder)');
         }
         const localAppData = env['LOCALAPPDATA'];
         const userProfile = env['USERPROFILE'];
@@ -124,33 +137,27 @@ export async function probeCandidateRoots(deps = {}) {
             const probe = deps.driveLetterProbe ?? probeGoogleDriveLetter;
             const letter = await probe();
             if (letter !== null) {
-                await maybeAdd(pathMod.join(`${letter}:`, 'My Drive'), 'Google Drive');
-                await maybeAdd(pathMod.join(`${letter}:`, '我的云端硬盘'), 'Google Drive');
+                await maybeAddCloud(pathMod.join(`${letter}:`, 'My Drive'), 'Google Drive (MemDrive folder)');
+                await maybeAddCloud(pathMod.join(`${letter}:`, '我的云端硬盘'), 'Google Drive (MemDrive folder)');
             }
         }
         // Common-path fallback: existence-checked only, never assumed.
-        await maybeAdd(pathMod.join('G:', 'My Drive'), 'Google Drive');
-        await maybeAdd(pathMod.join('G:', '我的云端硬盘'), 'Google Drive');
-        await maybeAdd(pathMod.join('H:', 'My Drive'), 'Google Drive');
+        await maybeAddCloud(pathMod.join('G:', 'My Drive'), 'Google Drive (MemDrive folder)');
+        await maybeAddCloud(pathMod.join('G:', '我的云端硬盘'), 'Google Drive (MemDrive folder)');
+        await maybeAddCloud(pathMod.join('H:', 'My Drive'), 'Google Drive (MemDrive folder)');
         if (userProfile !== undefined) {
-            await maybeAdd(pathMod.join(userProfile, 'Google Drive'), 'Google Drive');
-            await maybeAdd(pathMod.join(userProfile, 'iCloudDrive'), 'iCloud Drive');
+            await maybeAddCloud(pathMod.join(userProfile, 'Google Drive'), 'Google Drive (MemDrive folder)');
+            await maybeAddCloud(pathMod.join(userProfile, 'iCloudDrive'), 'iCloud Drive (MemDrive folder)');
         }
     }
     else {
-        await maybeAdd(pathMod.join(home, 'OneDrive'), 'OneDrive');
+        await maybeAddCloud(pathMod.join(home, 'OneDrive'), 'OneDrive (MemDrive folder)');
         if (platform === 'darwin') {
-            await maybeAdd(pathMod.join(pathMod.sep, 'Volumes', 'GoogleDrive'), 'Google Drive');
-            await maybeAdd(pathMod.join(home, 'Google Drive'), 'Google Drive');
-            await maybeAdd(pathMod.join(home, 'Library', 'Mobile Documents', 'com~apple~CloudDocs'), 'iCloud Drive');
+            await maybeAddCloud(pathMod.join(pathMod.sep, 'Volumes', 'GoogleDrive'), 'Google Drive (MemDrive folder)');
+            await maybeAddCloud(pathMod.join(home, 'Google Drive'), 'Google Drive (MemDrive folder)');
+            await maybeAddCloud(pathMod.join(home, 'Library', 'Mobile Documents', 'com~apple~CloudDocs'), 'iCloud Drive (MemDrive folder)');
         }
     }
-    // The default is always offered; the wizard creates it if missing.
-    // It must match the server default in config.ts (`~/memdrive`).
-    found.push({
-        path: pathMod.join(home, 'memdrive'),
-        label: 'Default (~/memdrive)',
-    });
     return dedupeCandidates(found, pathMod);
 }
 /**

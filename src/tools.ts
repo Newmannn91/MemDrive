@@ -25,6 +25,7 @@ import { z } from 'zod';
 
 import {
   IMAGE_PREVIEW_MAX_BYTES,
+  IMAGE_PREVIEW_MAX_PIXELS,
   READ_MAX_IMAGES,
   SAVE_IMAGES_MAX_DOWNLOAD_BYTES,
   SAVE_IMAGES_MAX_TOTAL_BYTES,
@@ -43,19 +44,23 @@ import {
   detectImageMime,
   encodeImageSrc,
   extensionForMime,
+  type ImageDimensions,
   type ImageSaveBudget,
   makePreview,
   maxBinaryForBase64Budget,
   mimeFromExtension,
+  parseImageDimensions,
   scanMarkdownImages,
   type MarkdownImageRef,
 } from './images.js';
 import {
   assertInsideRealRoot,
   isInside,
+  realLocation,
   sandboxPath,
   sandboxPathForWrite,
   toDisplayPath,
+  validateCrossPlatformSegments,
 } from './sandbox.js';
 import {
   LocalSearchIndex,
@@ -91,19 +96,67 @@ export interface CleanupPlan {
   actions: PlanAction[];
 }
 
+/** True when a library-relative path names `archive` or anything under `archive/`. */
+function isArchiveRelPath(rel: string): boolean {
+  const lower = rel.toLowerCase();
+  return lower === 'archive' || lower.startsWith('archive/');
+}
+
+/** True when a library-relative path points to a child strictly inside `archive/`. */
+function isInsideArchiveRelPath(rel: string): boolean {
+  return rel.toLowerCase().startsWith('archive/');
+}
+
+/** Resolve an absolute path's symlink-free location as a root-relative POSIX display path. */
+async function realRelOf(ctx: ToolContext, absolutePath: string): Promise<string> {
+  return toDisplayPath(ctx.rootRealDir, await realLocation(absolutePath));
+}
+
+/**
+ * macOS only: an evicted iCloud Drive / OneDrive placeholder reports
+ * a positive logical size with zero allocated 512-byte disk blocks.
+ */
+function isDatalessStat(st: { size: number; blocks?: number }): boolean {
+  return process.platform === 'darwin' && st.size > 0 && st.blocks === 0;
+}
+
+/**
+ * Verify that neither the lexical path nor its symlink-resolved real path
+ * points to the library root itself or inside top-level `archive/`.
+ */
+async function assertNonArchiveFileTarget(
+  ctx: ToolContext,
+  absolute: string,
+  rel: string,
+  toolName: string,
+  archiveAction: string,
+): Promise<void> {
+  const realRel = await realRelOf(ctx, absolute);
+  if (rel === '.' || realRel === '.') {
+    throw new MemDriveError('INVALID_PATH', `${toolName} needs a file path, not the library root.`);
+  }
+  if (isArchiveRelPath(rel) || isArchiveRelPath(realRel)) {
+    const target = isArchiveRelPath(rel) ? rel : `${rel} -> ${realRel}`;
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `Cannot ${archiveAction} (${target}). Use restore_file to bring it back first.`,
+    );
+  }
+}
+
 /** True when a path must never appear in a cleanup plan: any
     path segment starting with '.', or anything under archive/.
     Paths are POSIX-style (forward slashes). */
 function isSkippedPlanPath(p: string): boolean {
-  const lower = p.toLowerCase();
-  if (lower === 'archive' || lower.startsWith('archive/')) return true;
+  if (isArchiveRelPath(p)) return true;
   return p.split('/').some((seg) => seg.startsWith('.'));
 }
 
-/** True when the path can be written through the sandbox. A
-    path that fails (for example a name containing ':') is
-    never proposed in a plan, because apply could not
-    execute it. */
+/** True when the path can be written through the sandbox and both its
+    real source (outside archive/) and real archive destination
+    (inside archive/) respect the archive boundary. A path that fails
+    (for example a name containing ':') is never proposed in a plan,
+    because apply could not execute it. */
 async function isWritablePlanPath(ctx: ToolContext, p: string): Promise<boolean> {
   // Same lexical rules apply uses (isSafePlanPath): a path apply
   // would reject (for example a Linux filename containing '\')
@@ -115,23 +168,40 @@ async function isWritablePlanPath(ctx: ToolContext, p: string): Promise<boolean>
     // changes under normalization would make apply act on a
     // different file, so it is never proposed.
     if (toDisplayPath(ctx.rootDir, abs) !== p) return false;
-    await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, `archive/${p}`);
-    return true;
+    const srcRealRel = await realRelOf(ctx, abs);
+    if (srcRealRel === '.' || isArchiveRelPath(srcRealRel)) return false;
+    const destAbs = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, `archive/${p}`);
+    return isInsideArchiveRelPath(await realRelOf(ctx, destAbs));
   } catch {
     return false;
   }
 }
 
-/** True when the path itself is a symlink (lstat), or cannot be
-    lstat'ed. Symlinks are never archived and never kept as a
-    duplicate keeper: their content/mtime mirror the target, so
-    archiving the target would leave the "kept" copy dangling. */
+/** True when the path or any parent segment under rootRealDir is a
+    symlink (lstat), or cannot be lstat'ed. Symlinks are never archived
+    and never kept as a duplicate keeper: their content/mtime mirror
+    the target, so archiving the target would leave the "kept" copy
+    dangling. */
 async function isSymlinkPath(ctx: ToolContext, p: string): Promise<boolean> {
-  try {
-    return (await fs.lstat(path.join(ctx.rootRealDir, p))).isSymbolicLink();
-  } catch {
+  const segments = p.split('/').filter((s) => s.length > 0 && s !== '.');
+  if (segments.length === 0) {
     return true;
   }
+  let current = ctx.rootRealDir;
+  for (const seg of segments) {
+    if (seg === '..') {
+      return true;
+    }
+    current = path.join(current, seg);
+    try {
+      if ((await fs.lstat(current)).isSymbolicLink()) {
+        return true;
+      }
+    } catch {
+      return true;
+    }
+  }
+  return false;
 }
 
 const PLAN_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -151,6 +221,15 @@ export async function buildCleanupPlan(
       const st = await ctx.backend.stat(p);
       if (st === null) return null;
       if (st.isDirectory) return null;
+      if (isDatalessStat(st)) {
+        if (!seenWarningPaths.has(p)) {
+          seenWarningPaths.add(p);
+          statWarnings.push(
+            `Warning: skipped ${p} during plan verification (cloud-only dataless placeholder; not scanned).`,
+          );
+        }
+        return null;
+      }
       const mtimeMs = new Date(st.modifiedAt).getTime();
       const size = st.size;
       const sha256 = await ctx.backend.hashFile(p);
@@ -490,6 +569,17 @@ export async function runApplyCleanup(planId: string, ctx: ToolContext, options?
       recordSkipped(action, 'path is a symlink (symlinks are never archived)');
       continue;
     }
+    let srcRealRel: string;
+    try {
+      srcRealRel = await realRelOf(ctx, absolute);
+    } catch (error) {
+      recordSkipped(action, error instanceof Error ? error.message : String(error));
+      continue;
+    }
+    if (srcRealRel === '.' || isArchiveRelPath(srcRealRel)) {
+      recordSkipped(action, `path resolves inside archive/ (${srcRealRel})`);
+      continue;
+    }
 
     let st: Awaited<ReturnType<StorageBackend['stat']>>;
     try {
@@ -504,6 +594,13 @@ export async function runApplyCleanup(planId: string, ctx: ToolContext, options?
     }
     if (st.isDirectory) {
       recordSkipped(action, 'path is a directory, not a file');
+      continue;
+    }
+    if (isDatalessStat(st)) {
+      recordSkipped(
+        action,
+        'warning: file is a cloud-only dataless placeholder (not scanned)',
+      );
       continue;
     }
 
@@ -551,14 +648,16 @@ export async function runApplyCleanup(planId: string, ctx: ToolContext, options?
       } else if (!isSafePlanPath(keeper)) {
         noLongerReason = 'no longer a duplicate of its keeper';
       } else {
-        let keeperExists = false;
+        let keeperStat: Awaited<ReturnType<StorageBackend['stat']>> = null;
         try {
-          keeperExists = (await ctx.backend.stat(keeper)) !== null;
+          keeperStat = await ctx.backend.stat(keeper);
         } catch {
-          keeperExists = false;
+          keeperStat = null;
         }
-        if (!keeperExists) {
+        if (keeperStat === null) {
           noLongerReason = 'keeper no longer on disk';
+        } else if (isDatalessStat(keeperStat)) {
+          noLongerReason = 'warning: keeper is a cloud-only dataless placeholder (not scanned)';
         } else if (await isSymlinkPath(ctx, keeper)) {
           // A symlink keeper mirrors its target: archiving the target
           // would leave the "kept" copy dangling.
@@ -576,10 +675,16 @@ export async function runApplyCleanup(planId: string, ctx: ToolContext, options?
     try {
       if (action.action === 'archive') {
         const destRel = `archive/${action.path}`;
+        let destRealRel: string;
         try {
-          await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, destRel);
+          const destAbs = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, destRel);
+          destRealRel = await realRelOf(ctx, destAbs);
         } catch {
           recordSkipped(action, 'archive destination not allowed for writing');
+          continue;
+        }
+        if (!isInsideArchiveRelPath(destRealRel)) {
+          recordSkipped(action, `archive destination resolves outside archive/ (${destRealRel})`);
           continue;
         }
         if (await ctx.backend.exists(destRel)) {
@@ -701,26 +806,34 @@ function formatNotesSection(notes: readonly string[]): string {
  * truncated (UTF-8-safe) to make room for the notes section; when the
  * notes alone fill the allowance, the body is dropped and the notes
  * are truncated instead, so image paths and skip reasons survive.
+ * When `body` is truncated here and no truncation note is present yet,
+ * a budget truncation note is prepended to the notes section.
  */
 function assembleText(
   body: string,
   notes: string[],
   budget: number,
   imageBase64Total: number,
+  bodyAlreadyTruncated = false,
 ): string {
   const allowedTextBytes = budget - imageBase64Total;
   if (allowedTextBytes <= 0) {
     return '';
   }
-  if (notes.length === 0) {
-    return truncateUtf8(body, allowedTextBytes);
-  }
-  const notesSection = formatNotesSection(notes);
-  const notesBytes = utf8Bytes(notesSection);
   const bodyBytes = utf8Bytes(body);
-  if (bodyBytes + notesBytes <= allowedTextBytes) {
-    return body + notesSection;
+  const initialNotesSection = formatNotesSection(notes);
+  if (bodyBytes + utf8Bytes(initialNotesSection) <= allowedTextBytes) {
+    return body + initialNotesSection;
   }
+  const finalNotes =
+    !bodyAlreadyTruncated && body.length > 0
+      ? [
+          `Text truncated to fit the ${formatBytes(budget)} total response budget; the file on disk is untouched.`,
+          ...notes,
+        ]
+      : notes;
+  const notesSection = formatNotesSection(finalNotes);
+  const notesBytes = utf8Bytes(notesSection);
   if (notesBytes >= allowedTextBytes) {
     return truncateUtf8(notesSection, allowedTextBytes);
   }
@@ -744,6 +857,7 @@ async function handleListDirectory(
   ctx: ToolContext,
   inputPath: string | undefined,
 ): Promise<CallToolResult> {
+  const budget = responseBudgetBytes();
   const absolute = await sandboxPath(ctx.rootDir, ctx.rootRealDir, inputPath ?? '');
   const rel = relOf(ctx, absolute);
   const stat = await ctx.backend.stat(rel === '.' ? '' : rel);
@@ -758,17 +872,51 @@ async function handleListDirectory(
   }
   const entries = await ctx.backend.listDirectory(rel === '.' ? '' : rel);
   if (entries.length === 0) {
-    return okResult(`Directory ${rel} is empty.`);
+    return okResult(truncateUtf8(`Directory ${rel} is empty.`, budget));
   }
-  const lines = [`Directory: ${rel} (${entries.length} entries)`, ''];
-  for (const entry of entries) {
+  const header = `Directory: ${rel} (${entries.length} entries)\n`;
+  const footerFor = (shown: number): string =>
+    `\n\n[MemDrive note: listing truncated — showing ${shown} of ${entries.length} entries to stay within the ${formatBytes(budget)} response budget.]`;
+  const maxFooterBytes = utf8Bytes(footerFor(entries.length));
+  const headerBytes = utf8Bytes(header);
+  const entryLines: string[] = [];
+  let totalBytes = headerBytes;
+  let shownWithFooter = 0;
+  let truncated = false;
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
     const meta =
       entry.type === 'directory'
         ? '[dir] '
         : `[file] ${formatBytes(entry.size)} · modified ${entry.modifiedAt} · `;
-    lines.push(`${meta}${entry.name}`);
+    const line = `${meta}${entry.name}`;
+    totalBytes += utf8Bytes(`\n${line}`);
+    if (totalBytes <= budget - maxFooterBytes) {
+      shownWithFooter = i + 1;
+    }
+    entryLines.push(line);
+    if (totalBytes > budget) {
+      truncated = true;
+      break;
+    }
   }
-  return okResult(lines.join('\n'));
+  if (!truncated) {
+    return okResult(`${header}\n${entryLines.join('\n')}`);
+  }
+  const kept = entryLines.slice(0, shownWithFooter);
+  const footer = footerFor(kept.length);
+  const footerBytes = utf8Bytes(footer);
+  if (kept.length === 0) {
+    if (footerBytes >= budget) {
+      return okResult(truncateUtf8(footer.trimStart(), budget));
+    }
+    const trimmedHeader = header.trimEnd();
+    if (utf8Bytes(trimmedHeader) + footerBytes > budget) {
+      return okResult(truncateUtf8(trimmedHeader, budget - footerBytes) + footer);
+    }
+    return okResult(`${trimmedHeader}${footer}`);
+  }
+  return okResult(`${header}\n${kept.join('\n')}${footer}`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1140,16 +1288,7 @@ async function handleSaveFile(
   // under names like `meeting 10:30.md` still open.
   const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
   const rel = relOf(ctx, absolute);
-  if (rel === '.') {
-    throw new MemDriveError('INVALID_PATH', 'save_file needs a file path, not the library root.');
-  }
-  const lowerRel = rel.toLowerCase();
-  if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
-    throw new MemDriveError(
-      'INVALID_ARGUMENT',
-      `Cannot write into archive/ (${rel}). Use restore_file to bring it back first.`,
-    );
-  }
+  await assertNonArchiveFileTarget(ctx, absolute, rel, 'save_file', 'write into archive/');
   const existingStat = await ctx.backend.stat(rel);
   if (existingStat !== null) {
     if (existingStat.isDirectory) {
@@ -1208,7 +1347,15 @@ async function handleSaveFile(
         // the images would be written outside the root. Refuse the
         // images with a note; the text still saves.
         try {
-          await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, assetsRel);
+          const assetsAbs = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, assetsRel);
+          const assetsRealRel = await realRelOf(ctx, assetsAbs);
+          if (isArchiveRelPath(assetsRealRel)) {
+            assetsOk = false;
+            notes.push(
+              'Images were not stored: the assets folder links into archive/.',
+            );
+            break;
+          }
         } catch {
           assetsOk = false;
           notes.push(
@@ -1219,8 +1366,17 @@ async function handleSaveFile(
       }
       if (assetsOk) {
         if (!assetsDirEnsured) {
-          await ctx.backend.ensureDir(assetsRel);
-          assetsDirEnsured = true;
+          try {
+            await ctx.backend.ensureDir(assetsRel);
+            assetsDirEnsured = true;
+          } catch (error) {
+            assetsOk = false;
+            const message = error instanceof Error ? error.message : String(error);
+            notes.push(
+              `Images were not stored: could not create assets folder: ${message}`,
+            );
+            break;
+          }
         }
         const image = result.image;
         const ext = extensionForMime(image.mimeType);
@@ -1378,15 +1534,31 @@ function readTag(raw: string): string {
   // A single pass matters: two sequential passes would corrupt `\\"`
   // into `"`. Any other `\x` is left intact, so a literal backslash
   // in a hand-written `"a\b"` survives. A matching pair of single
-  // quotes is a YAML single-quoted scalar, where `\` is literal:
-  // strip the quotes without unescaping.
+  // quotes is a YAML single-quoted scalar, where `\` is literal and
+  // `''` unescapes to a single `'`.
   if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
     return unescapeDoubleQuoted(trimmed.slice(1, -1)).replace(/^#+/, '').trim();
   }
   if (trimmed.length >= 2 && trimmed.startsWith("'") && trimmed.endsWith("'")) {
-    return trimmed.slice(1, -1).replace(/^#+/, '').trim();
+    return trimmed.slice(1, -1).replace(/''/g, "'").replace(/^#+/, '').trim();
   }
-  return trimmed.replace(/^['"]|['"]$/g, '').replace(/^#+/, '').trim();
+  return trimmed.replace(/^#+/, '').trim();
+}
+
+function hasUnsafeYamlControlChars(tag: string): boolean {
+  for (const ch of tag) {
+    const code = ch.codePointAt(0) as number;
+    if (
+      (code < 0x20 && ch !== '\t') ||
+      code === 0x7f ||
+      (code >= 0x80 && code <= 0x9f) ||
+      code === 0x2028 ||
+      code === 0x2029
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** A tag that can be stored in front matter without breaking the YAML or being dropped on read. */
@@ -1397,23 +1569,12 @@ function isFrontMatterStorable(tag: string): boolean {
     !/^'|'$/.test(tag) &&
     !/^#/.test(tag) &&
     !/\s#/.test(tag) &&
-    !tag.includes(': ') &&
-    !tag.startsWith('-') &&
-    !tag.endsWith('\\')
+    !hasUnsafeYamlControlChars(tag)
   );
 }
 
 function isQuotedStorable(tag: string): boolean {
-  if (tag.length === 0 || tag.includes('"')) {
-    return false;
-  }
-  for (const ch of tag) {
-    const code = ch.codePointAt(0) as number;
-    if (code < 0x20 && ch !== '\t') {
-      return false;
-    }
-  }
-  return true;
+  return tag.length > 0 && !tag.includes('"') && !hasUnsafeYamlControlChars(tag);
 }
 
 /** A tag that can appear as a body `#tag` (same shape `extractTags` accepts). */
@@ -1421,52 +1582,195 @@ function isBodyTag(tag: string): boolean {
   return /^[\p{L}\p{N}_][\p{L}\p{N}_/-]*$/u.test(tag) && /\p{L}/u.test(tag);
 }
 
-/** Split the bracketed contents of a flow list, respecting quoted items (`"a,b"` is one item). */
-function splitFlowItems(inner: string): string[] {
+/**
+ * Step past one character (or two-character escape sequence) inside an active
+ * YAML quoted scalar, returning the updated quote state and characters consumed.
+ */
+function stepInsideQuote(
+  text: string,
+  index: number,
+  quote: string,
+): { nextQuote: string | null; consumed: number } {
+  const ch = text[index] as string;
+  if (quote === '"' && ch === '\\' && index + 1 < text.length) {
+    return { nextQuote: quote, consumed: 2 };
+  }
+  if (quote === "'" && ch === "'" && index + 1 < text.length && text[index + 1] === "'") {
+    return { nextQuote: quote, consumed: 2 };
+  }
+  if (ch === quote) {
+    return { nextQuote: null, consumed: 1 };
+  }
+  return { nextQuote: quote, consumed: 1 };
+}
+
+/**
+ * Scan comma-separated YAML flow-list items starting at `startIndex`.
+ * Quotes only open a quoted scalar at the start of an item (YAML rule),
+ * so mid-token apostrophes like `Bob's` stay ordinary characters rather
+ * than swallowing commas or closing brackets. When `stopOnCloseBracket`
+ * is true, stops at the first unquoted `]` and returns null if unclosed.
+ */
+function scanFlowItems(
+  text: string,
+  startIndex: number,
+  stopOnCloseBracket: boolean,
+): { items: string[]; endIndex: number } | null {
   const items: string[] = [];
   let cur = '';
   let quote: string | null = null;
-  for (let i = 0; i < inner.length; i++) {
-    const ch = inner[i] as string;
-    if (quote === '"') {
-      // Inside double quotes a backslash escapes the next character.
-      cur += ch;
-      if (ch === '\\' && i + 1 < inner.length) {
-        cur += inner[i + 1] as string;
-        i++;
-      } else if (ch === '"') {
-        quote = null;
-      }
-    } else if (quote !== null) {
-      cur += ch;
-      if (ch === quote) {
-        quote = null;
-      }
-    } else if (ch === '"' || ch === "'") {
+  let atItemStart = true;
+  for (let i = startIndex; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (quote !== null) {
+      const step = stepInsideQuote(text, i, quote);
+      cur += text.slice(i, i + step.consumed);
+      quote = step.nextQuote;
+      i += step.consumed - 1;
+    } else if ((ch === '"' || ch === "'") && atItemStart) {
       quote = ch;
+      atItemStart = false;
       cur += ch;
+    } else if (stopOnCloseBracket && ch === ']') {
+      items.push(cur);
+      return { items, endIndex: i };
     } else if (ch === ',') {
       items.push(cur);
       cur = '';
+      atItemStart = true;
     } else {
+      if (ch !== ' ' && ch !== '\t') {
+        atItemStart = false;
+      }
       cur += ch;
     }
   }
+  if (stopOnCloseBracket) {
+    return null;
+  }
   items.push(cur);
-  return items;
+  return { items, endIndex: text.length };
 }
 
-/** Quote a flow-list item when a comma or single quote inside it would break parsing on read. */
+/** Split the bracketed contents of a flow list, respecting quoted items (`"a,b"` is one item). */
+function splitFlowItems(inner: string): string[] {
+  return (scanFlowItems(inner, 0, false) as { items: string[] }).items;
+}
+
+/**
+ * True when an unquoted tag scalar would be invalid YAML or would parse as a
+ * non-string (boolean, null, number, float, timestamp) in YAML 1.1 (PyYAML) or 1.2.
+ */
+function needsYamlQuoting(tag: string): boolean {
+  if (tag.length === 0 || tag.trim() !== tag) {
+    return true;
+  }
+  if (/^[-?:,\[\]{}#&*!|>'"%@`\s]/.test(tag) || /^(?:---|\.\.\.)/.test(tag)) {
+    return true;
+  }
+  if (tag === '=' || tag === '<<') {
+    return true;
+  }
+  if (
+    /[\[\]{}",'\\?:\t\r\n\u00a0\u1680\u2000-\u200a\u202f\u205f\u3000]/.test(tag) ||
+    /(?:^|\s)#/.test(tag)
+  ) {
+    return true;
+  }
+  for (const ch of tag) {
+    const code = ch.codePointAt(0) as number;
+    if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      return true;
+    }
+  }
+  if (/^(?:~|null|y|n|yes|no|true|false|on|off)$/i.test(tag)) {
+    return true;
+  }
+  if (
+    /^[-+]?(?:[0-9][0-9_]*|0[oOxXbB][0-9a-fA-F_]+|[0-9][0-9_]*(?::[0-5]?[0-9])+)$/.test(
+      tag,
+    )
+  ) {
+    return true;
+  }
+  if (
+    /^[-+]?(?:(?:\.[0-9][0-9_]*|[0-9][0-9_]*\.[0-9_]*)(?:[eE][-+]?[0-9_]+)?|[0-9][0-9_]*[eE][-+]?[0-9_]+|[0-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*|\.(?:inf|nan))$/i.test(
+      tag,
+    )
+  ) {
+    return true;
+  }
+  if (/^\d{4}-\d{1,2}-\d{1,2}(?:$|(?:[Tt]|[ \t]+)\d)/.test(tag)) {
+    return true;
+  }
+  return false;
+}
+
+function escapeDoubleQuotedYaml(tag: string): string {
+  return '"' + tag.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+const DOUBLE_QUOTED_YAML_SCALAR_RE =
+  /^"(?:[^"\\]|\\(?:[0abtnvfre "\\/N_LP\t]|x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|U00(?:0[0-9a-fA-F]|10)[0-9a-fA-F]{4}))*"$/;
+const SINGLE_QUOTED_YAML_SCALAR_RE = /^'(?:[^']|'')*'$/;
+
+/** True when `raw` is syntactically wrapped as a single quoted scalar (even if escapes are invalid). */
+function isQuotedToken(raw: string): boolean {
+  return /^"(?:\\.|[^"\\])*"$/.test(raw) || SINGLE_QUOTED_YAML_SCALAR_RE.test(raw);
+}
+
+function isValidQuotedScalar(raw: string): boolean {
+  return (
+    DOUBLE_QUOTED_YAML_SCALAR_RE.test(raw) ||
+    SINGLE_QUOTED_YAML_SCALAR_RE.test(raw)
+  );
+}
+
+/**
+ * True when an unquoted raw front-matter token starts a YAML list item (`- `)
+ * or contains a mapping separator (`: `), so its existing meaning cannot be safely parsed.
+ */
+function hasUnsafeUnquotedFmToken(raw: string): boolean {
+  if (isQuotedToken(raw)) {
+    return false;
+  }
+  return (
+    raw.startsWith('- ') ||
+    raw.startsWith('-\t') ||
+    raw.includes(': ') ||
+    raw.includes(':\t')
+  );
+}
+
+function assertSafeInlineItems(items: FmInlineItem[]): void {
+  if (
+    items.some(
+      (item) =>
+        (item.raw !== undefined && hasUnsafeUnquotedFmToken(item.raw)) ||
+        !isFrontMatterStorable(item.tag),
+    )
+  ) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+    );
+  }
+}
+
+/** Quote a flow-list item when YAML syntax or type safety requires double quotes. */
 function quoteFlowItem(item: string): string {
-  return item.includes(',') || item.includes("'")
-    ? '"' + item.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
-    : item;
+  return needsYamlQuoting(item) ? escapeDoubleQuotedYaml(item) : item;
 }
 
 function quoteBlockItem(tag: string): string {
-  return isFrontMatterStorable(tag)
-    ? tag
-    : '"' + tag.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  return needsYamlQuoting(tag) ? escapeDoubleQuotedYaml(tag) : tag;
+}
+
+function formatFlowItem(item: FmInlineItem): string {
+  if (item.raw !== undefined && isValidQuotedScalar(item.raw)) {
+    return item.raw;
+  }
+  return quoteFlowItem(item.tag);
 }
 
 /** The line ending of a line ('' when the line is the last one and has none). */
@@ -1480,6 +1784,13 @@ function lineEnding(line: string): string {
   return '';
 }
 
+interface FmInlineItem {
+  /** Tag text as read (unquoted, leading `#` stripped, case preserved). */
+  tag: string;
+  /** Trimmed raw token from the source file, when present. */
+  raw?: string;
+}
+
 /**
  * The `tags:` entry of a front-matter body: which form it takes, the
  * tags it holds, and the spans needed to rewrite just that entry.
@@ -1490,6 +1801,8 @@ interface FmTagEntry {
   form: 'flow' | 'block' | 'plain' | 'none';
   /** Tags in order, as written (case preserved). */
   tags: string[];
+  /** Flow/plain items with their original raw tokens so untouched quoting is preserved. */
+  inlineItems: FmInlineItem[];
   /** Index of the `tags:` line, or -1 when there is no `tags:` line. */
   lineIndex: number;
   /** Flow: the text after the closing `]` on the line. Plain: the trailing comment (from `#`) or ''. */
@@ -1516,6 +1829,7 @@ function parseFmTags(fmBody: string): FmTagEntry {
   const none: FmTagEntry = {
     form: 'none',
     tags: [],
+    inlineItems: [],
     lineIndex: -1,
     suffix: '',
     blockItems: [],
@@ -1540,43 +1854,59 @@ function parseFmTags(fmBody: string): FmTagEntry {
     // Flow list. A `#` inside the brackets is a tag character, not
     // a comment — only a `#` after the closing `]` starts one (same
     // rule `extractTags` uses).
-    const bracket = /^\[((?:[^\]"']|"(?:\\.|[^"\\])*"|'[^']*')*)\]/.exec(value);
-    if (bracket === null) {
+    const flow = scanFlowItems(value, 1, true);
+    if (flow === null) {
       throw new MemDriveError(
         'INVALID_ARGUMENT',
         'The tags line could not be parsed (unclosed "["); fix it manually and retry.',
       );
     }
-    const tags = splitFlowItems(bracket[1] as string)
-      .map((p) => readTag(p))
-      .filter((t) => t.length > 0);
-    if (tags.some((t) => !isFrontMatterStorable(t))) {
-      throw new MemDriveError(
-        'INVALID_ARGUMENT',
-        'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
-      );
+    const inlineItems: FmInlineItem[] = [];
+    for (const part of flow.items) {
+      const raw = part.trim();
+      if ((raw.startsWith('"') || raw.startsWith("'")) && !isQuotedToken(raw)) {
+        throw new MemDriveError(
+          'INVALID_ARGUMENT',
+          'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+        );
+      }
+      const tag = readTag(raw);
+      if (tag.length > 0) {
+        inlineItems.push({ tag, raw });
+      }
     }
+    assertSafeInlineItems(inlineItems);
+    const tags = inlineItems.map((item) => item.tag);
     return {
       form: 'flow',
       tags,
+      inlineItems,
       lineIndex,
-      suffix: value.slice((bracket[0] as string).length),
+      suffix: value.slice(flow.endIndex + 1),
       blockItems: [],
     };
   }
   // Block list: the `tags:` line has no value (or only a comment)
-  // and `- item` lines follow it. Blank lines inside the block are
-  // skipped; the first non-blank, non-item line ends it.
+  // and `- item` lines follow it. Blank lines and standalone `#`
+  // comment lines inside the block are skipped; an unindented non-item
+  // line ends the block, while indented non-item content is refused so
+  // unknown YAML structures are never corrupted.
   if (value === '' || value.startsWith('#')) {
     const blockItems: FmBlockItem[] = [];
     for (let i = lineIndex + 1; i < lines.length; i++) {
       const rawLine = lines[i] as string;
       const content = rawLine.replace(/\r?\n$/, '');
-      if (content.trim() === '') {
+      if (content.trim() === '' || /^[ \t]*#/.test(content)) {
         continue;
       }
       const m = /^([ \t]*)-(?:[ \t]+(.*))?$/.exec(content);
       if (m === null) {
+        if (/^[ \t]/.test(content)) {
+          throw new MemDriveError(
+            'INVALID_ARGUMENT',
+            'The tags block contains unsupported YAML content that cannot be edited safely; fix it manually and retry.',
+          );
+        }
         break;
       }
       const indent = m[1] as string;
@@ -1601,13 +1931,11 @@ function parseFmTags(fmBody: string): FmTagEntry {
       for (let j = 0; j < trimmedItem.length; j++) {
         const ch = trimmedItem[j] as string;
         if (quote !== null) {
-          // Inside double quotes a backslash escapes the next
-          // character, so `\"` does not close the quote.
-          if (quote === '"' && ch === '\\') {
-            j++;
-          } else if (ch === quote) {
-            quote = null;
-          }
+          // Inside double quotes `\"` escapes `"`, and inside single quotes `''`
+          // escapes `'`, so neither closes the scalar early.
+          const step = stepInsideQuote(trimmedItem, j, quote);
+          quote = step.nextQuote;
+          j += step.consumed - 1;
         } else if ((ch === '"' || ch === "'") && j === 0) {
           // A quote only opens a quoted scalar at the start of the
           // value (YAML rule): a quote mid-value (the `'` in
@@ -1623,6 +1951,17 @@ function parseFmTags(fmBody: string): FmTagEntry {
         }
       }
       const rawValue = (commentIdx === -1 ? trimmedItem : trimmedItem.slice(0, commentIdx)).trimEnd();
+      if (
+        rawValue.length > 0 &&
+        (hasUnsafeUnquotedFmToken(rawValue) ||
+          ((rawValue.startsWith('"') || rawValue.startsWith("'")) &&
+            !isValidQuotedScalar(rawValue)))
+      ) {
+        throw new MemDriveError(
+          'INVALID_ARGUMENT',
+          'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+        );
+      }
       blockItems.push({
         lineIndex: i,
         indent,
@@ -1642,6 +1981,7 @@ function parseFmTags(fmBody: string): FmTagEntry {
       return {
         form: 'block',
         tags,
+        inlineItems: [],
         lineIndex,
         suffix: '',
         blockItems,
@@ -1652,6 +1992,7 @@ function parseFmTags(fmBody: string): FmTagEntry {
     return {
       form: 'plain',
       tags: [],
+      inlineItems: [],
       lineIndex,
       suffix: value.startsWith('#') ? rest : '',
       blockItems: [],
@@ -1669,11 +2010,9 @@ function parseFmTags(fmBody: string): FmTagEntry {
   for (let j = 0; j < rest.length; j++) {
     const ch = rest[j] as string;
     if (quote !== null) {
-      if (quote === '"' && ch === '\\') {
-        j++;
-      } else if (ch === quote) {
-        quote = null;
-      }
+      const step = stepInsideQuote(rest, j, quote);
+      quote = step.nextQuote;
+      j += step.consumed - 1;
     } else if ((ch === '"' || ch === "'") && atItemStart) {
       quote = ch;
       atItemStart = false;
@@ -1692,33 +2031,67 @@ function parseFmTags(fmBody: string): FmTagEntry {
       atItemStart = false;
     }
   }
+  if (quote !== null) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+    );
+  }
   const itemsEnd = commentIdx === -1 ? rest.length : commentIdx;
   rawItems.push(rest.slice(itemStart, itemsEnd));
   const suffix =
     commentIdx === -1
       ? ''
       : (commentHasLeadWs ? '' : ' ') + rest.slice(commentIdx);
-  const tags = rawItems
-    .map((p) => readTag(p))
-    .filter((t) => t.length > 0);
-  if (tags.some((t) => !isFrontMatterStorable(t))) {
-    throw new MemDriveError(
-      'INVALID_ARGUMENT',
-      'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
-    );
+  const inlineItems: FmInlineItem[] = [];
+  for (const part of rawItems) {
+    const raw = part.trim();
+    if ((raw.startsWith('"') || raw.startsWith("'")) && !isValidQuotedScalar(raw)) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        'The tags line contains a value that cannot be edited safely; fix it manually and retry.',
+      );
+    }
+    const tag = readTag(raw);
+    if (tag.length > 0) {
+      inlineItems.push({ tag, raw });
+    }
   }
-  return { form: 'plain', tags, lineIndex, suffix, blockItems: [] };
+  assertSafeInlineItems(inlineItems);
+  const tags = inlineItems.map((item) => item.tag);
+  return { form: 'plain', tags, inlineItems, lineIndex, suffix, blockItems: [] };
 }
 
-/** Format a plain `tags:` line, upgrading to flow syntax if any item contains a comma. */
-function formatPlainTagsLine(items: string[], suffix: string, eol: string): string {
+/**
+ * Format a plain `tags:` line, upgrading to flow syntax when multiple items
+ * contain commas or require YAML quoting (unbracketed `a, "b"` is invalid YAML).
+ */
+function formatPlainTagsLine(
+  items: FmInlineItem[],
+  suffix: string,
+  eol: string,
+): string {
   if (items.length === 0) {
     return `tags:${suffix}${eol}`;
   }
-  if (items.some((t) => t.includes(','))) {
-    return `tags: [${items.map(quoteFlowItem).join(', ')}]${suffix}${eol}`;
+  if (items.length === 1) {
+    const only = items[0] as FmInlineItem;
+    if (only.tag.includes(',')) {
+      return `tags: [${formatFlowItem(only)}]${suffix}${eol}`;
+    }
+    return `tags: ${formatFlowItem(only)}${suffix}${eol}`;
   }
-  return `tags: ${items.join(', ')}${suffix}${eol}`;
+  if (
+    items.some(
+      (item) =>
+        item.tag.includes(',') ||
+        needsYamlQuoting(item.tag) ||
+        (item.raw !== undefined && isValidQuotedScalar(item.raw)),
+    )
+  ) {
+    return `tags: [${items.map(formatFlowItem).join(', ')}]${suffix}${eol}`;
+  }
+  return `tags: ${items.map((item) => item.tag).join(', ')}${suffix}${eol}`;
 }
 
 /**
@@ -1748,9 +2121,9 @@ function editFrontMatterTags(
       return `tags: [${quoteFlowItem(tag)}]${eol}${fmBody}`;
     }
     if (entry.form === 'flow') {
-      const items = [...entry.tags, tag];
+      const items: FmInlineItem[] = [...entry.inlineItems, { tag }];
       lines[entry.lineIndex] =
-        `tags: [${items.map(quoteFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
+        `tags: [${items.map(formatFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
       return lines.join('');
     }
     if (entry.form === 'block') {
@@ -1769,7 +2142,7 @@ function editFrontMatterTags(
       return lines.join('');
     }
     // Plain value (possibly empty): rebuild the line.
-    const items = [...entry.tags, tag];
+    const items: FmInlineItem[] = [...entry.inlineItems, { tag }];
     lines[entry.lineIndex] = formatPlainTagsLine(
       items,
       entry.suffix,
@@ -1782,9 +2155,9 @@ function editFrontMatterTags(
       return null;
     }
     if (entry.form === 'flow') {
-      const items = entry.tags.filter((t) => t.toLowerCase() !== lower);
+      const items = entry.inlineItems.filter((item) => item.tag.toLowerCase() !== lower);
       lines[entry.lineIndex] =
-        `tags: [${items.map(quoteFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
+        `tags: [${items.map(formatFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
       return lines.join('');
     }
     if (entry.form === 'block') {
@@ -1807,7 +2180,7 @@ function editFrontMatterTags(
       }
       return lines.join('');
     }
-    const items = entry.tags.filter((t) => t.toLowerCase() !== lower);
+    const items = entry.inlineItems.filter((item) => item.tag.toLowerCase() !== lower);
     lines[entry.lineIndex] = formatPlainTagsLine(
       items,
       entry.suffix,
@@ -1824,11 +2197,11 @@ function editFrontMatterTags(
     return null;
   }
   if (entry.form === 'flow') {
-    const items = entry.tags.map((t) =>
-      t.toLowerCase() === lower ? (newTag as string) : t,
+    const items: FmInlineItem[] = entry.inlineItems.map((item) =>
+      item.tag.toLowerCase() === lower ? { tag: newTag as string } : item,
     );
     lines[entry.lineIndex] =
-      `tags: [${items.map(quoteFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
+      `tags: [${items.map(formatFlowItem).join(', ')}]${entry.suffix}${lineEnding(lines[entry.lineIndex] as string)}`;
     return lines.join('');
   }
   if (entry.form === 'block') {
@@ -1843,8 +2216,8 @@ function editFrontMatterTags(
     }
     return lines.join('');
   }
-  const items = entry.tags.map((t) =>
-    t.toLowerCase() === lower ? (newTag as string) : t,
+  const items: FmInlineItem[] = entry.inlineItems.map((item) =>
+    item.tag.toLowerCase() === lower ? { tag: newTag as string } : item,
   );
   lines[entry.lineIndex] = formatPlainTagsLine(
     items,
@@ -2059,17 +2432,12 @@ async function handleEditTags(
   // Writes get the cross-platform segment check, like save_file.
   const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
   const rel = relOf(ctx, absolute);
-  if (rel === '.') {
-    throw new MemDriveError(
-      'INVALID_PATH',
-      'edit_tags needs a file path, not the library root.',
-    );
-  }
-  const lowerRel = rel.toLowerCase();
-  if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
+  await assertNonArchiveFileTarget(ctx, absolute, rel, 'edit_tags', 'edit a file inside archive/');
+  const ext = path.extname(absolute).toLowerCase();
+  if (!MARKDOWN_EXTENSIONS.has(ext)) {
     throw new MemDriveError(
       'INVALID_ARGUMENT',
-      `Cannot edit a file inside archive/ (${rel}). Use restore_file to bring it back first.`,
+      `Cannot edit tags on ${rel}: tags can only be edited on Markdown notes (${[...MARKDOWN_EXTENSIONS].join(', ')}).`,
     );
   }
   const stat = await ctx.backend.stat(rel);
@@ -2130,13 +2498,13 @@ async function handleEditTags(
     if (operation === 'add' && !isFrontMatterStorable(cleanTag)) {
       throw new MemDriveError(
         'INVALID_ARGUMENT',
-        `Tag ${JSON.stringify(cleanTag)} cannot be stored in front matter (it contains [, ], {, }, ", leading/trailing ', leading #, or whitespace followed by #).`,
+        `Tag ${JSON.stringify(cleanTag)} cannot be stored in front matter (it contains [, ], {, }, ", control characters, leading/trailing ', leading #, or whitespace followed by #).`,
       );
     }
     if (cleanNew !== undefined && !isFrontMatterStorable(cleanNew)) {
       throw new MemDriveError(
         'INVALID_ARGUMENT',
-        `Tag ${JSON.stringify(cleanNew)} cannot be stored in front matter (it contains [, ], {, }, ", leading/trailing ', leading #, or whitespace followed by #).`,
+        `Tag ${JSON.stringify(cleanNew)} cannot be stored in front matter (it contains [, ], {, }, ", control characters, leading/trailing ', leading #, or whitespace followed by #).`,
       );
     }
   } else {
@@ -2344,6 +2712,33 @@ function canonicalImageKey(relPath: string): string {
     : nfc;
 }
 
+function tooLargePixelsNote(
+  filePath: string,
+  width: number,
+  height: number,
+  displayRef?: string,
+): string {
+  const limit = IMAGE_PREVIEW_MAX_PIXELS.toLocaleString('en-US');
+  const location =
+    displayRef !== undefined && displayRef !== filePath
+      ? `${displayRef} (${filePath})`
+      : filePath;
+  return `Image too large to preview (${location}, ${width}×${height} pixels, over the ${limit}-pixel limit). The file is unchanged; use open_image to view it on this computer.`;
+}
+
+function isCorruptPreviewFailure(
+  data: Buffer,
+  cap: number,
+  dims: ImageDimensions | null,
+): boolean {
+  const detected = detectImageMime(data);
+  return (
+    data.length <= cap ||
+    detected === null ||
+    (detected !== 'image/webp' && dims === null)
+  );
+}
+
 async function handleReadFile(
   ctx: ToolContext,
   inputPath: string,
@@ -2386,6 +2781,12 @@ async function handleReadFile(
       : (mimeFromExtension(absolute) ?? (ext === '' ? detectImageMime(data) : null));
   if (directImageMime !== null) {
     const mimeType = directImageMime;
+    const dims = parseImageDimensions(data);
+    if (dims !== null && dims.width * dims.height > IMAGE_PREVIEW_MAX_PIXELS) {
+      return okResult(
+        truncateUtf8(tooLargePixelsNote(rel, dims.width, dims.height), budget),
+      );
+    }
     const effectiveCap = Math.min(
       IMAGE_PREVIEW_MAX_BYTES,
       maxBinaryForBase64Budget(
@@ -2402,7 +2803,7 @@ async function handleReadFile(
     let preview = await makePreview(data, mimeType, effectiveCap);
     if (preview === null) {
       return notReturned(
-        data.length <= effectiveCap || detectImageMime(data) === null
+        isCorruptPreviewFailure(data, effectiveCap, dims)
           ? 'the file is corrupt or not a valid image.'
           : `it could not be downscaled to fit the ${formatBytes(budget)} total response budget (format not supported by the built-in decoder, or still over budget at minimum size).`,
       );
@@ -2449,12 +2850,15 @@ async function handleReadFile(
     const svgText = decodeText(data, rel);
     const svgNotes: string[] = [];
     const effectiveTextCap = Math.min(TEXT_MAX_BYTES, budget);
-    if (utf8Bytes(svgText) > effectiveTextCap) {
+    let svgBody = svgText;
+    const svgTruncated = utf8Bytes(svgBody) > effectiveTextCap;
+    if (svgTruncated) {
       svgNotes.push(
         `Text truncated to the ${formatBytes(effectiveTextCap)} read cap; the file on disk is untouched.`,
       );
+      svgBody = truncateUtf8(svgBody, effectiveTextCap);
     }
-    return okResult(assembleText(svgText, svgNotes, budget, 0));
+    return okResult(assembleText(svgBody, svgNotes, budget, 0, svgTruncated));
   }
 
   // Everything else must decode as text.
@@ -2488,7 +2892,7 @@ async function handleReadFile(
       // referenced image paths (library-relative, ready for a direct
       // read_file call each). No image blocks are returned.
       if (refs.length === 0) {
-        return okResult(assembleText(body, notes, budget, 0));
+        return okResult(assembleText(body, notes, budget, 0, bodyTruncated));
       }
       const listed: string[] = [];
       const seen = new Set<string>();
@@ -2645,10 +3049,15 @@ async function handleReadFile(
           notes.push(budgetSkipNote);
           continue;
         }
+        const dims = parseImageDimensions(imageData);
+        if (dims !== null && dims.width * dims.height > IMAGE_PREVIEW_MAX_PIXELS) {
+          notes.push(tooLargePixelsNote(imageRel, dims.width, dims.height, ref.src));
+          continue;
+        }
         const preview = await makePreview(imageData, mimeType, cap);
         if (preview === null) {
           notes.push(
-            imageData.length <= cap || detectImageMime(imageData) === null
+            isCorruptPreviewFailure(imageData, cap, dims)
               ? `Skipped image ${ref.src} (${formatBytes(imageData.length)}): the file is corrupt or not a valid image; original untouched.`
               : `Skipped image ${ref.src} (${formatBytes(imageData.length)}): could not be downscaled to fit the remaining response budget; original untouched. Read it directly with read_file on "${imageRel}" — a direct read gives it the whole budget.`,
           );
@@ -2696,13 +3105,13 @@ async function handleReadFile(
     }
     return {
       content: [
-        textBlock(assembleText(body, notes, budget, imageBase64Total)),
+        textBlock(assembleText(body, notes, budget, imageBase64Total, bodyTruncated)),
         ...imageBlocks,
       ],
     };
   }
 
-  return okResult(assembleText(body, notes, budget, 0));
+  return okResult(assembleText(body, notes, budget, 0, bodyTruncated));
 }
 
 function decodeText(data: Buffer, rel: string): string {
@@ -2875,20 +3284,27 @@ async function handleArchiveFile(
 ): Promise<CallToolResult> {
   const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
   const rel = relOf(ctx, absolute);
-  if (rel === '.') {
+  const realRel = await realRelOf(ctx, absolute);
+  if (rel === '.' || realRel === '.') {
     throw new MemDriveError(
       'INVALID_ARGUMENT',
       'archive_file needs a file path, not the library root.',
     );
   }
-  // [Issue 6] Case-insensitive check for top-level archive/
-  const lowerRel = rel.toLowerCase();
-  if (lowerRel === 'archive' || lowerRel.startsWith('archive/')) {
+  // [Issue 6] Case-insensitive check for top-level archive/ (lexical and symlink-resolved)
+  if (isArchiveRelPath(rel) || isArchiveRelPath(realRel)) {
+    const lowerRel = rel.toLowerCase();
+    const lowerReal = realRel.toLowerCase();
+    if (lowerRel === 'archive' || lowerReal === 'archive') {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        'Cannot archive the archive folder itself.',
+      );
+    }
+    const target = isArchiveRelPath(rel) ? rel : `${rel} -> ${realRel}`;
     throw new MemDriveError(
       'INVALID_ARGUMENT',
-      lowerRel === 'archive'
-        ? 'Cannot archive the archive folder itself.'
-        : `${rel} is already in archive/.`,
+      `${target} is already in archive/.`,
     );
   }
   const stat = await ctx.backend.stat(rel);
@@ -2904,6 +3320,13 @@ async function handleArchiveFile(
   const destRel = `archive/${rel}`;
   const destAbsolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, destRel);
   const cleanDestRel = relOf(ctx, destAbsolute);
+  const destRealRel = await realRelOf(ctx, destAbsolute);
+  if (!isInsideArchiveRelPath(cleanDestRel) || !isInsideArchiveRelPath(destRealRel)) {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `Archive destination must resolve inside archive/ (got ${cleanDestRel} -> ${destRealRel}).`,
+    );
+  }
   if (await ctx.backend.exists(cleanDestRel)) {
     throw new MemDriveError(
       'ALREADY_EXISTS',
@@ -2922,8 +3345,7 @@ async function handleRestoreFile(
   const absolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, inputPath);
   const rel = relOf(ctx, absolute);
   // [Issue 6] Case-insensitive check for top-level archive/
-  const lowerRel = rel.toLowerCase();
-  if (!lowerRel.startsWith('archive/')) {
+  if (!isInsideArchiveRelPath(rel)) {
     throw new MemDriveError(
       'INVALID_ARGUMENT',
       `restore_file requires a file inside archive/ (got ${rel}).`,
@@ -2936,6 +3358,39 @@ async function handleRestoreFile(
       'restore_file needs a file path inside archive/, not archive/ itself.',
     );
   }
+  let isSymlinkLeaf = false;
+  try {
+    isSymlinkLeaf = (await fs.lstat(absolute)).isSymbolicLink();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+      throw error;
+    }
+  }
+  if (isSymlinkLeaf) {
+    // A leaf symlink archived via archive_file stays a symlink and may target
+    // a library file outside archive/; check that the symlink entry itself
+    // sits in real archive/ rather than following the leaf link target.
+    const parentRealRel = await realRelOf(ctx, path.dirname(absolute));
+    if (!isArchiveRelPath(parentRealRel)) {
+      const entryRealRel =
+        parentRealRel === '.'
+          ? path.basename(absolute)
+          : `${parentRealRel}/${path.basename(absolute)}`;
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        `restore_file requires a file whose real location is inside archive/ (got ${rel} -> ${entryRealRel}).`,
+      );
+    }
+  } else {
+    const srcRealRel = await realRelOf(ctx, absolute);
+    if (!isInsideArchiveRelPath(srcRealRel)) {
+      throw new MemDriveError(
+        'INVALID_ARGUMENT',
+        `restore_file requires a file whose real location is inside archive/ (got ${rel} -> ${srcRealRel}).`,
+      );
+    }
+  }
   const stat = await ctx.backend.stat(rel);
   if (stat === null) {
     throw new NotFoundError(`File not found: ${rel}`);
@@ -2946,13 +3401,37 @@ async function handleRestoreFile(
       `${rel} is a directory. Only files can be restored.`,
     );
   }
-  const destAbsolute = await sandboxPathForWrite(ctx.rootDir, ctx.rootRealDir, destRel);
+  // Resolve destRel verbatim without cleanPath so leading ~/ , surrounding
+  // quotes, or leading whitespace in archived filenames are never rewritten.
+  const destAbsolute = path.resolve(ctx.rootDir, ...destRel.split('/'));
+  if (!isInside(ctx.rootDir, destAbsolute)) {
+    throw new SandboxError(
+      `Path escapes the MemDrive root (${ctx.rootDir}): ${JSON.stringify(destRel)}`,
+    );
+  }
   const cleanDestRel = relOf(ctx, destAbsolute);
-  const lowerDestRel = cleanDestRel.toLowerCase();
-  if (lowerDestRel === 'archive' || lowerDestRel.startsWith('archive/')) {
+  if (cleanDestRel !== destRel) {
     throw new MemDriveError(
       'INVALID_ARGUMENT',
-      `Cannot restore ${rel} into archive/ (${cleanDestRel}).`,
+      `Destination path ${JSON.stringify(destRel)} changed under normalization (${JSON.stringify(cleanDestRel)}).`,
+    );
+  }
+  validateCrossPlatformSegments(cleanDestRel);
+  await assertInsideRealRoot(ctx.rootRealDir, destAbsolute);
+  const destRealRel = await realRelOf(ctx, destAbsolute);
+  if (cleanDestRel === '.' || destRealRel === '.') {
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `Cannot restore ${rel} to the library root.`,
+    );
+  }
+  if (isArchiveRelPath(cleanDestRel) || isArchiveRelPath(destRealRel)) {
+    const target = isArchiveRelPath(cleanDestRel)
+      ? cleanDestRel
+      : `${cleanDestRel} -> ${destRealRel}`;
+    throw new MemDriveError(
+      'INVALID_ARGUMENT',
+      `Cannot restore ${rel} into archive/ (${target}).`,
     );
   }
   if (await ctx.backend.exists(cleanDestRel)) {
@@ -3153,7 +3632,7 @@ export function registerTools(
     'edit_tags',
     {
       description: [
-        'Edit the tags on an existing note: add one tag, remove one tag, or rename one tag. One operation per call.',
+        'Edit the tags on an existing Markdown note (.md, .markdown, .mdx; other file types are not supported): add one tag, remove one tag, or rename one tag. One operation per call.',
         'Tags live in two places: YAML front matter `tags:` (inline `[a, b]` or block `- a`) and body `#tag`s. The location parameter picks which one to edit (default front_matter).',
         'Only the tag lines change: the rest of the file is left byte-for-byte identical (no reflow, no other front-matter field touched). Adding a tag to a note with no front matter creates a minimal `---\\ntags: [tag]\\n---` block at the top; adding a body tag appends `#tag` on its own line at the end of the file.',
         'No-ops are not errors: adding a tag that is already there, removing one that is not there, and renaming to a name that already exists all succeed with a "No change" result. Tag names are case-insensitive.',

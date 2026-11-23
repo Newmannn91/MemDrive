@@ -26,6 +26,7 @@ import { readClipboardImage } from './clipboard.js';
 import {
   IMAGE_MIME_BY_EXTENSION,
   IMAGE_PREVIEW_MAX_BYTES,
+  IMAGE_PREVIEW_MAX_PIXELS,
   IMAGE_PREVIEW_MIME,
   IMAGE_PREVIEW_MIN_DIMENSION,
   IMAGE_PREVIEW_QUALITIES,
@@ -404,12 +405,150 @@ async function downloadImage(
   }
 }
 
+const UNC_OR_DEVICE_PATH_NOTE =
+  'network/UNC or device paths are not supported for local images; copy the file to a local drive or a mapped drive letter.';
+
+/**
+ * True when a user-supplied local path is a UNC share or Windows device
+ * path (`\\...`, `//...`, `\\?\...`, `\\.\...`, `\\?\UNC\...`). Checked
+ * before `cleanPath` because `path.posix.normalize` collapses leading `//`.
+ */
+function isUncOrDevicePath(spec: string): boolean {
+  let p = spec.trim();
+  for (;;) {
+    if (
+      p.length >= 2 &&
+      ((p.startsWith('"') && p.endsWith('"')) ||
+        (p.startsWith("'") && p.endsWith("'")))
+    ) {
+      p = p.slice(1, -1).trim();
+      continue;
+    }
+    break;
+  }
+  return p.replace(/\\/g, '/').startsWith('//');
+}
+
+const MAX_LOCAL_SYMLINK_HOPS = 40;
+
+/**
+ * Walk `absolutePath` segment by segment using `lstat` and `readlink`
+ * (never `stat` or `realpath`) so a symlink at any segment pointing to
+ * a UNC share or device path is rejected before the OS follows it.
+ */
+async function resolveLocalImagePathNoUnc(
+  absolutePath: string,
+): Promise<{ path: string } | { uncOrDevice: true } | { errorMessage: string }> {
+  if (isUncOrDevicePath(absolutePath)) {
+    return { uncOrDevice: true };
+  }
+  const segSepRe = process.platform === 'win32' ? /[\\/]+/ : /\/+/;
+  const initialParsed = path.parse(absolutePath);
+  let resolvedPrefix = initialParsed.root;
+  if (isUncOrDevicePath(resolvedPrefix)) {
+    return { uncOrDevice: true };
+  }
+  const pending = absolutePath
+    .slice(initialParsed.root.length)
+    .split(segSepRe)
+    .filter((s) => s.length > 0);
+
+  let hops = 0;
+  while (pending.length > 0) {
+    const seg = pending.shift() as string;
+    if (seg === '.') {
+      continue;
+    }
+    if (seg === '..') {
+      const parent = path.dirname(resolvedPrefix);
+      if (parent.length >= path.parse(resolvedPrefix).root.length) {
+        resolvedPrefix = parent;
+      }
+      continue;
+    }
+    const nextPath = path.join(resolvedPrefix, seg);
+    if (isUncOrDevicePath(nextPath)) {
+      return { uncOrDevice: true };
+    }
+    let lst: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      lst = await fs.lstat(nextPath);
+    } catch (error) {
+      return { errorMessage: error instanceof Error ? error.message : String(error) };
+    }
+    if (!lst.isSymbolicLink()) {
+      resolvedPrefix = nextPath;
+      continue;
+    }
+    hops += 1;
+    if (hops > MAX_LOCAL_SYMLINK_HOPS) {
+      return { errorMessage: `Too many levels of symbolic links: ${absolutePath}` };
+    }
+    let target: string;
+    try {
+      target = await fs.readlink(nextPath);
+    } catch (error) {
+      return { errorMessage: error instanceof Error ? error.message : String(error) };
+    }
+    if (isUncOrDevicePath(target)) {
+      return { uncOrDevice: true };
+    }
+    if (path.isAbsolute(target)) {
+      const targetParsed = path.parse(target);
+      const targetRest = target
+        .slice(targetParsed.root.length)
+        .split(segSepRe)
+        .filter((s) => s.length > 0);
+      // On Windows, a root-relative target (`\foo`) keeps the current drive root.
+      if (targetParsed.root === '\\' || targetParsed.root === '/') {
+        const prefixRoot = path.parse(resolvedPrefix).root;
+        resolvedPrefix = prefixRoot || targetParsed.root;
+      } else {
+        resolvedPrefix = targetParsed.root;
+      }
+      pending.unshift(...targetRest);
+    } else {
+      pending.unshift(...target.split(segSepRe).filter((s) => s.length > 0));
+    }
+  }
+  if (isUncOrDevicePath(resolvedPrefix)) {
+    return { uncOrDevice: true };
+  }
+  return { path: resolvedPrefix };
+}
+
 /** Copy an image from a local OS path (outside the sandbox root is fine). */
 async function copyLocalImage(spec: string, budget?: ImageSaveBudget): Promise<ImageAcquisition> {
-  const cleaned = cleanPath(spec);
+  if (isUncOrDevicePath(spec)) {
+    return { ok: false, note: UNC_OR_DEVICE_PATH_NOTE };
+  }
+  let cleaned: string;
+  try {
+    cleaned = cleanPath(spec);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, note: `Could not read local image ${spec}: ${message}` };
+  }
+  if (isUncOrDevicePath(cleaned)) {
+    return { ok: false, note: UNC_OR_DEVICE_PATH_NOTE };
+  }
+  const cwd = process.cwd();
+  if (!path.isAbsolute(cleaned) && isUncOrDevicePath(cwd)) {
+    return { ok: false, note: UNC_OR_DEVICE_PATH_NOTE };
+  }
   const absolute = path.isAbsolute(cleaned)
     ? path.resolve(cleaned)
-    : path.resolve(process.cwd(), cleaned);
+    : path.resolve(cwd, cleaned);
+  if (isUncOrDevicePath(absolute)) {
+    return { ok: false, note: UNC_OR_DEVICE_PATH_NOTE };
+  }
+  const resolved = await resolveLocalImagePathNoUnc(absolute);
+  if ('uncOrDevice' in resolved) {
+    return { ok: false, note: UNC_OR_DEVICE_PATH_NOTE };
+  }
+  if ('errorMessage' in resolved) {
+    return { ok: false, note: `Could not read local image ${spec}: ${resolved.errorMessage}` };
+  }
   // Refuse non-regular files outright: /dev/zero, FIFOs, and device
   // nodes report size 0, so a size check alone cannot stop an
   // unbounded read — and readFile on them never returns. A stat
@@ -417,7 +556,7 @@ async function copyLocalImage(spec: string, budget?: ImageSaveBudget): Promise<I
   // read that would report a different, misleading error.
   let st: Awaited<ReturnType<typeof fs.stat>>;
   try {
-    st = await fs.stat(absolute);
+    st = await fs.stat(resolved.path);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, note: `Could not read local image ${spec}: ${message}` };
@@ -432,7 +571,7 @@ async function copyLocalImage(spec: string, budget?: ImageSaveBudget): Promise<I
   }
   let data: Buffer;
   try {
-    data = await fs.readFile(absolute);
+    data = await fs.readFile(resolved.path);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, note: `Could not read local image ${spec}: ${message}` };
@@ -519,10 +658,208 @@ export function maxBinaryForBase64Budget(base64Budget: number): number {
   return Math.floor(base64Budget / 4) * 3;
 }
 
+/** Pixel dimensions parsed from an image container header. */
+export interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
+const JPEG_SOF_MARKERS = new Set([
+  0xc0, 0xc1, 0xc2, 0xc3,
+  0xc5, 0xc6, 0xc7,
+  0xc9, 0xca, 0xcb,
+  0xcd, 0xce, 0xcf,
+]);
+
+function parsePngDimensions(data: Buffer): ImageDimensions | null {
+  if (data.length < 24 || data.subarray(12, 16).toString('ascii') !== 'IHDR') {
+    return null;
+  }
+  const width = data.readUInt32BE(16);
+  const height = data.readUInt32BE(20);
+  return width > 0 && height > 0 ? { width, height } : null;
+}
+
+function parseGifDimensions(data: Buffer): ImageDimensions | null {
+  if (data.length < 10) {
+    return null;
+  }
+  const width = data.readUInt16LE(6);
+  const height = data.readUInt16LE(8);
+  return width > 0 && height > 0 ? { width, height } : null;
+}
+
+function parseBmpDimensions(data: Buffer): ImageDimensions | null {
+  if (data.length < 18) {
+    return null;
+  }
+  const dibSize = data.readUInt32LE(14);
+  if (dibSize === 12) {
+    if (data.length < 22) {
+      return null;
+    }
+    const width = data.readUInt16LE(18);
+    const height = data.readUInt16LE(20);
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+  if (dibSize >= 40) {
+    if (data.length < 26) {
+      return null;
+    }
+    const width = data.readInt32LE(18);
+    const height = Math.abs(data.readInt32LE(22));
+    return width > 0 && height > 0 ? { width, height } : null;
+  }
+  return null;
+}
+
+function parseJpegDimensions(data: Buffer): ImageDimensions | null {
+  if (data.length < 4 || data.readUInt8(0) !== 0xff || data.readUInt8(1) !== 0xd8) {
+    return null;
+  }
+  let offset = 2;
+  while (offset < data.length) {
+    if (data.readUInt8(offset) !== 0xff) {
+      return null;
+    }
+    while (offset < data.length && data.readUInt8(offset) === 0xff) {
+      offset += 1;
+    }
+    if (offset >= data.length) {
+      return null;
+    }
+    const marker = data.readUInt8(offset);
+    offset += 1;
+    // Standalone markers with no 2-byte length field: TEM (0x01) and RST0-RST7 (0xD0-0xD7).
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      continue;
+    }
+    // Stuffed 0x00, SOI (0xD8), EOI (0xD9), or SOS (0xDA) before SOF means no frame header.
+    if (marker === 0x00 || marker === 0xd8 || marker === 0xd9 || marker === 0xda) {
+      return null;
+    }
+    if (offset + 2 > data.length) {
+      return null;
+    }
+    const segmentLength = data.readUInt16BE(offset);
+    if (segmentLength < 2) {
+      return null;
+    }
+    if (JPEG_SOF_MARKERS.has(marker)) {
+      if (segmentLength < 8 || offset + 7 > data.length) {
+        return null;
+      }
+      const height = data.readUInt16BE(offset + 3);
+      const width = data.readUInt16BE(offset + 5);
+      return width > 0 && height > 0 ? { width, height } : null;
+    }
+    offset += segmentLength;
+  }
+  return null;
+}
+
+function parseTiffDimensions(data: Buffer): ImageDimensions | null {
+  if (data.length < 8) {
+    return null;
+  }
+  const b0 = data.readUInt8(0);
+  const b1 = data.readUInt8(1);
+  let littleEndian: boolean;
+  if (b0 === 0x49 && b1 === 0x49) {
+    littleEndian = true;
+  } else if (b0 === 0x4d && b1 === 0x4d) {
+    littleEndian = false;
+  } else {
+    return null;
+  }
+  const readU16 = (off: number): number =>
+    littleEndian ? data.readUInt16LE(off) : data.readUInt16BE(off);
+  const readU32 = (off: number): number =>
+    littleEndian ? data.readUInt32LE(off) : data.readUInt32BE(off);
+  if (readU16(2) !== 42) {
+    return null;
+  }
+  const ifdOffset = readU32(4);
+  if (ifdOffset < 8 || ifdOffset + 2 > data.length) {
+    return null;
+  }
+  const entryCount = readU16(ifdOffset);
+  if (ifdOffset + 2 + entryCount * 12 > data.length) {
+    return null;
+  }
+  let width: number | null = null;
+  let height: number | null = null;
+  for (let i = 0; i < entryCount; i += 1) {
+    const entryOffset = ifdOffset + 2 + i * 12;
+    const tag = readU16(entryOffset);
+    if (tag !== 256 && tag !== 257) {
+      continue;
+    }
+    const fieldType = readU16(entryOffset + 2);
+    const count = readU32(entryOffset + 4);
+    if (count !== 1) {
+      return null;
+    }
+    let value: number;
+    if (fieldType === 3) {
+      // SHORT (16-bit) is left-justified in the 4-byte value/offset slot.
+      value = readU16(entryOffset + 8);
+    } else if (fieldType === 4) {
+      value = readU32(entryOffset + 8);
+    } else if (fieldType === 1) {
+      value = data.readUInt8(entryOffset + 8);
+    } else {
+      return null;
+    }
+    if (tag === 256) {
+      width = value;
+    } else {
+      height = value;
+    }
+    if (width !== null && height !== null) {
+      break;
+    }
+  }
+  if (width === null || height === null || width === 0 || height === 0) {
+    return null;
+  }
+  return { width, height };
+}
+
+/**
+ * Parse pixel dimensions from an image file header without decoding
+ * pixel data. Supports PNG, JPEG, GIF, BMP, and TIFF; returns null
+ * for unrecognized, truncated/corrupt, or undecoded (WebP) headers.
+ * Never throws.
+ */
+export function parseImageDimensions(data: Buffer): ImageDimensions | null {
+  try {
+    switch (detectImageMime(data)) {
+      case 'image/png':
+        return parsePngDimensions(data);
+      case 'image/jpeg':
+        return parseJpegDimensions(data);
+      case 'image/gif':
+        return parseGifDimensions(data);
+      case 'image/bmp':
+        return parseBmpDimensions(data);
+      case 'image/tiff':
+        return parseTiffDimensions(data);
+      default:
+        return null;
+    }
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Build a model-facing preview for an image buffer.
  *
- * Returns the original bytes untouched when under `maxBytes`. When over,
+ * Returns the original bytes untouched when under `maxBytes`. Before
+ * decoding with jimp, inspects the container header for non-WebP images
+ * and returns null immediately when dimensions cannot be read or exceed
+ * `IMAGE_PREVIEW_MAX_PIXELS`. When over `maxBytes`,
  * decodes with jimp and tries, in order from mildest to most aggressive:
  * a JPEG re-encode at full resolution (scale 1.0 — for PNG screenshots
  * this alone usually drops below the cap with no detail lost to
@@ -532,7 +869,8 @@ export function maxBinaryForBase64Budget(base64Budget: number): number {
  * so the preview stays close to the largest size the budget allows
  * instead of stopping far below it. At the minimum dimension, lower
  * JPEG qualities are tried before giving up. Returns null when no
- * preview can be produced (format the decoder cannot read, or the
+ * preview can be produced (format the decoder cannot read, pixel count
+ * over IMAGE_PREVIEW_MAX_PIXELS, or the
  * image stays over the cap even at minimum size/quality) — callers
  * then report a note instead. The on-disk original is never modified
  * by this function.
@@ -553,6 +891,12 @@ export async function makePreview(
   const detectedMime = detectImageMime(data);
   if (detectedMime === null) {
     return null;
+  }
+  if (detectedMime !== 'image/webp') {
+    const dims = parseImageDimensions(data);
+    if (dims === null || dims.width * dims.height > IMAGE_PREVIEW_MAX_PIXELS) {
+      return null;
+    }
   }
   if (
     data.length > maxBytes &&

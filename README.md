@@ -282,8 +282,9 @@ What the wizard does, in order:
    wizard with no argument. An unrecognised argument falls back
    to the prompt instead of guessing a host.
 1. **Finds a library folder.** It probes for existing sync folders —
-   OneDrive, Google Drive, iCloud — plus the `~/memdrive` default,
-   and shows a numbered menu. Google Drive on Windows is probed in
+   OneDrive, Google Drive, iCloud — and shows a numbered menu,
+   with the `~/memdrive` default first, followed by each cloud
+   drive's `MemDrive` subfolder. Google Drive on Windows is probed in
    three steps: the DriveFS install folder must exist, then a
    PowerShell volume-label probe finds the drive letter, then
    common paths (`G:\My Drive`, `H:\My Drive`, …) are checked for
